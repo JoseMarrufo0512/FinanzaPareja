@@ -3,11 +3,115 @@ import Decimal from 'decimal.js';
 import { initDb, query } from '@/lib/db';
 import { refreshRates, getLatestRates } from '@/lib/rates';
 import { D, fmt } from '@/lib/money';
+import { parseExpenseText } from '@/lib/parser';
+import { tg, sendMessage, answerCallback, downloadFile, setWebhook, getWebhookInfo } from '@/lib/telegram';
+import { transcribeAudio, extractReceipt } from '@/lib/ai';
+import { startScheduler } from '@/lib/scheduler';
 
 Decimal.set({ precision: 30, rounding: Decimal.ROUND_HALF_UP });
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
+
+// Kick off scheduler once when this module loads
+try { startScheduler(); } catch (e) { console.error('scheduler init', e.message); }
+
+// Given a parsed expense and the sender's user record, create the transaction and confirm via Telegram.
+async function handleParsedExpense(me, parsed, chatId, source = 'WHATSAPP_BOT') {
+  const users = (await query('SELECT id, name, short FROM app_users')).rows;
+  let beneficiary_id = null;
+  if (parsed.type === 'PRESTAMO') {
+    // Prefer explicit hint, else pick the other user in a 2-user setup
+    if (parsed.beneficiaryHint) {
+      const hint = parsed.beneficiaryHint.toLowerCase();
+      const found = users.find(u => u.id !== me.id && (u.short?.toLowerCase() === hint || u.name.toLowerCase().startsWith(hint)));
+      if (found) beneficiary_id = found.id;
+    }
+    if (!beneficiary_id) {
+      const other = users.find(u => u.id !== me.id);
+      if (other) beneficiary_id = other.id;
+      else {
+        await sendMessage(chatId, '❌ No hay otro usuario configurado para el préstamo.');
+        return;
+      }
+    }
+  }
+  const tx = await createTransaction({
+    payer_id: me.id, type: parsed.type,
+    original_amount: parsed.amount.toString(), original_currency: parsed.currency,
+    beneficiary_id, description: parsed.description || null, created_via: source,
+  });
+  const usdtLine = tx.amount_usdt ? `\n❄️ <b>Congelado:</b> ${Number(tx.amount_usdt).toFixed(2)} USDT` : '';
+  const benef = beneficiary_id ? users.find(u => u.id === beneficiary_id)?.name : null;
+  const typeIcon = { NOS: '👫', MIO: '🧑', PRESTAMO: '🤝' }[parsed.type];
+  await sendMessage(chatId,
+    `${typeIcon} <b>Registrado #${parsed.type}</b>\n` +
+    `${parsed.currency} <b>${parsed.amount.toFixed(2)}</b> · ~$${Number(tx.amount_usd).toFixed(2)} USD${usdtLine}\n` +
+    (benef ? `Para: <b>${benef}</b>\n` : '') +
+    (parsed.description ? `<i>${parsed.description}</i>` : ''));
+  notifyPartner(tx).catch(() => {});
+}
+
+// Shared helper: create transaction (used by web and telegram)
+async function createTransaction(b) {
+  const rates = await getLatestRates();
+  const originalAmount = D(b.original_amount);
+  const currency = b.original_currency;
+  let appliedRate;
+  if (b.applied_rate !== undefined && b.applied_rate !== null && b.applied_rate !== '') appliedRate = D(b.applied_rate);
+  else if (currency === 'USD') appliedRate = D(1);
+  else if (currency === 'BS') appliedRate = D(rates.bcv_usd?.rate || 1);
+  else if (currency === 'EUR') {
+    const bu = D(rates.bcv_usd?.rate || 1); const be = D(rates.bcv_eur?.rate || 1);
+    appliedRate = be.isZero() ? D(1) : bu.div(be);
+  } else if (currency === 'USDT') appliedRate = D(1);
+  else appliedRate = D(1);
+  let amountUsd = (currency === 'USD' || currency === 'USDT') ? originalAmount : (appliedRate.isZero() ? originalAmount : originalAmount.div(appliedRate));
+  amountUsd = amountUsd.toDecimalPlaces(2);
+  let amountUsdt = null, usdtRate = null;
+  if (b.type === 'PRESTAMO') {
+    const bcvUsd = D(rates.bcv_usd?.rate || 0);
+    const binUsdt = D(rates.binance_usdt?.rate || 0);
+    usdtRate = binUsdt.toNumber() || null;
+    let ves;
+    if (currency === 'BS') ves = originalAmount;
+    else if (currency === 'USD') ves = originalAmount.mul(bcvUsd);
+    else if (currency === 'EUR') ves = originalAmount.mul(D(rates.bcv_eur?.rate || 0));
+    else if (currency === 'USDT') amountUsdt = originalAmount.toDecimalPlaces(2);
+    if (amountUsdt === null) amountUsdt = (binUsdt.gt(0) && ves) ? ves.div(binUsdt).toDecimalPlaces(2) : amountUsd;
+  }
+  const r = await query(
+    `INSERT INTO transactions(payer_id, wallet_id, type, original_amount, original_currency, applied_rate, amount_usd, amount_usdt, usdt_rate, beneficiary_id, category_id, description, receipt_image_url, created_via, transaction_date)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, COALESCE($15::timestamptz, NOW())) RETURNING *`,
+    [b.payer_id, b.wallet_id || null, b.type, originalAmount.toFixed(2), currency, appliedRate.toFixed(6), amountUsd.toFixed(2),
+     amountUsdt ? amountUsdt.toString() : null, usdtRate, b.beneficiary_id || null, b.category_id || null, b.description || null,
+     b.receipt_image_url || null, b.created_via || 'WEB', b.transaction_date || null]
+  );
+  return r.rows[0];
+}
+
+async function notifyPartner(tx) {
+  // Notify beneficiary (for PRESTAMO) or partner (for NOS) via Telegram
+  try {
+    const users = (await query('SELECT id, name, telegram_chat_id FROM app_users')).rows;
+    const payer = users.find(u => u.id === tx.payer_id);
+    let targets = [];
+    if (tx.type === 'PRESTAMO' && tx.beneficiary_id) {
+      const b = users.find(u => u.id === tx.beneficiary_id);
+      if (b?.telegram_chat_id) targets.push(b);
+    } else if (tx.type === 'NOS') {
+      targets = users.filter(u => u.id !== tx.payer_id && u.telegram_chat_id);
+    }
+    for (const t of targets) {
+      const emoji = tx.type === 'PRESTAMO' ? '❄️' : '👫';
+      const extra = tx.amount_usdt ? `\n<b>USDT congelado:</b> ${Number(tx.amount_usdt).toFixed(2)} ₮` : '';
+      const desc = tx.description ? `\n<i>${tx.description}</i>` : '';
+      await sendMessage(t.telegram_chat_id,
+        `${emoji} <b>${payer?.name || 'Alguien'}</b> registró un ${tx.type === 'PRESTAMO' ? 'préstamo para ti' : 'gasto compartido'}\n` +
+        `<b>${tx.original_currency} ${Number(tx.original_amount).toFixed(2)}</b> · ~$${Number(tx.amount_usd).toFixed(2)}${extra}${desc}`);
+    }
+  } catch (e) { console.error('notifyPartner', e.message); }
+}
 
 const json = (data, status = 200) => NextResponse.json(data, { status });
 const err = (msg, status = 400) => json({ error: msg }, status);
@@ -171,63 +275,9 @@ async function dispatch(req, params) {
     const b = await req.json();
     if (!b.payer_id || !b.type || !b.original_amount || !b.original_currency) return err('Faltan campos', 422);
     if (b.type === 'PRESTAMO' && !b.beneficiary_id) return err('Préstamo requiere beneficiario', 422);
-
-    const rates = await getLatestRates();
-    const originalAmount = D(b.original_amount);
-    const currency = b.original_currency;
-
-    // Determine applied rate (units of original per 1 USD). User may override.
-    let appliedRate;
-    if (b.applied_rate !== undefined && b.applied_rate !== null && b.applied_rate !== '') {
-      appliedRate = D(b.applied_rate);
-    } else if (currency === 'USD') appliedRate = D(1);
-    else if (currency === 'BS') appliedRate = D(rates.bcv_usd?.rate || 1);
-    else if (currency === 'EUR') {
-      // EUR per USD = bcv_usd / bcv_eur (both bs-per-x)
-      const bu = D(rates.bcv_usd?.rate || 1);
-      const be = D(rates.bcv_eur?.rate || 1);
-      appliedRate = be.isZero() ? D(1) : bu.div(be);
-    } else if (currency === 'USDT') appliedRate = D(1);
-    else appliedRate = D(1);
-
-    // amount_usd = original_amount / applied_rate  (except identity for USD/USDT)
-    let amountUsd;
-    if (currency === 'USD' || currency === 'USDT') amountUsd = originalAmount;
-    else amountUsd = appliedRate.isZero() ? originalAmount : originalAmount.div(appliedRate);
-    amountUsd = amountUsd.toDecimalPlaces(2);
-
-    // USDT freezing for PRESTAMO
-    let amountUsdt = null;
-    let usdtRate = null;
-    if (b.type === 'PRESTAMO') {
-      const bcvUsd = D(rates.bcv_usd?.rate || 0);
-      const binUsdt = D(rates.binance_usdt?.rate || 0);
-      usdtRate = binUsdt.toNumber() || null;
-      // Compute VES equivalent, then convert VES -> USDT via binance
-      let ves;
-      if (currency === 'BS') ves = originalAmount;
-      else if (currency === 'USD') ves = originalAmount.mul(bcvUsd);
-      else if (currency === 'EUR') ves = originalAmount.mul(D(rates.bcv_eur?.rate || 0));
-      else if (currency === 'USDT') { amountUsdt = originalAmount.toDecimalPlaces(2); }
-      if (amountUsdt === null) {
-        if (binUsdt.gt(0) && ves) amountUsdt = ves.div(binUsdt).toDecimalPlaces(2);
-        else amountUsdt = amountUsd; // fallback
-      }
-    }
-
-    const r = await query(
-      `INSERT INTO transactions(payer_id, wallet_id, type, original_amount, original_currency, applied_rate, amount_usd, amount_usdt, usdt_rate, beneficiary_id, category_id, description, receipt_image_url, created_via, transaction_date)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, COALESCE($15::timestamptz, NOW())) RETURNING *`,
-      [
-        b.payer_id, b.wallet_id || null, b.type, originalAmount.toFixed(2), currency,
-        appliedRate.toFixed(6), amountUsd.toFixed(2),
-        amountUsdt ? amountUsdt.toString() : null,
-        usdtRate,
-        b.beneficiary_id || null, b.category_id || null, b.description || null,
-        b.receipt_image_url || null, b.created_via || 'WEB', b.transaction_date || null,
-      ]
-    );
-    return json(r.rows[0], 201);
+    const tx = await createTransaction(b);
+    notifyPartner(tx).catch(() => {});
+    return json(tx, 201);
   }
 
   if (path.startsWith('/transactions/') && method === 'DELETE') {
@@ -276,6 +326,25 @@ async function dispatch(req, params) {
        VALUES($1,$2,$3,$4,$5) RETURNING *`,
       [b.payer_id, b.receiver_id, amtUsd.toFixed(2), amtUsdt, b.notes || null]
     );
+    // Mark all unreconciled NOS and PRESTAMO transactions involving these two users as reconciled
+    await query(
+      `UPDATE transactions SET is_reconciled=TRUE
+       WHERE is_reconciled=FALSE
+         AND type IN ('NOS','PRESTAMO')
+         AND (
+           (payer_id IN ($1,$2) AND type='NOS') OR
+           (type='PRESTAMO' AND (
+             (payer_id=$1 AND beneficiary_id=$2) OR (payer_id=$2 AND beneficiary_id=$1)
+           ))
+         )`,
+      [b.payer_id, b.receiver_id]
+    );
+    // Notify partner
+    notifyPartner({
+      payer_id: b.payer_id, type: 'SETTLEMENT', beneficiary_id: b.receiver_id,
+      original_amount: amtUsd.toFixed(2), original_currency: 'USD', amount_usd: amtUsd.toFixed(2),
+      amount_usdt: amtUsdt, description: b.notes || 'Liquidación de deuda',
+    }).catch(() => {});
     return json(r.rows[0], 201);
   }
   if (path === '/settlements' && method === 'GET') {
@@ -286,20 +355,154 @@ async function dispatch(req, params) {
     return json(r.rows);
   }
 
-  // -------- DASHBOARD --------
+  // -------- TELEGRAM WEBHOOK & SETUP --------
+  if (path === '/telegram/status' && method === 'GET') {
+    try { const info = await getWebhookInfo(); return json({ ok: true, info }); }
+    catch (e) { return json({ ok: false, error: e.message }); }
+  }
+  if (path === '/telegram/setup' && method === 'POST') {
+    const base = process.env.NEXT_PUBLIC_BASE_URL;
+    if (!base) return err('NEXT_PUBLIC_BASE_URL missing', 500);
+    const webhookUrl = `${base.replace(/\/$/, '')}/api/webhooks/telegram`;
+    const info = await setWebhook(webhookUrl, process.env.TELEGRAM_WEBHOOK_SECRET);
+    return json({ ok: true, webhook: webhookUrl, result: info });
+  }
+  if (path === '/telegram/unbind' && method === 'POST') {
+    const b = await req.json();
+    await query('UPDATE app_users SET telegram_chat_id=NULL WHERE id=$1', [b.user_id]);
+    return json({ ok: true });
+  }
+
+  if (path === '/webhooks/telegram' && method === 'POST') {
+    const secret = req.headers.get('x-telegram-bot-api-secret-token');
+    if (secret !== process.env.TELEGRAM_WEBHOOK_SECRET) return json({ ok: true }); // silently ignore
+    const upd = await req.json().catch(() => ({}));
+
+    // Callback query for user binding
+    if (upd.callback_query) {
+      const cq = upd.callback_query;
+      const data = cq.data || '';
+      if (data.startsWith('bind:')) {
+        const userId = data.slice(5);
+        const chatId = cq.message?.chat?.id;
+        try {
+          const u = await query('SELECT id, name FROM app_users WHERE id=$1', [userId]);
+          if (u.rowCount) {
+            await query('UPDATE app_users SET telegram_chat_id=$1 WHERE id=$2', [chatId, userId]);
+            await answerCallback(cq.id, `Vinculado como ${u.rows[0].name}`);
+            await sendMessage(chatId,
+              `✅ <b>¡Listo, ${u.rows[0].name}!</b> Ahora puedes registrar gastos así:\n\n` +
+              `📝 <b>Texto:</b> <code>30$ cena #Nos J</code>\n` +
+              `🎤 <b>Voz:</b> nota de voz "Gasté quinientos bolívares en café"\n` +
+              `📷 <b>Foto:</b> captura de Pago Móvil / POS\n\n` +
+              `Etiquetas: <code>#Nos</code> compartido · <code>#Mio</code> personal · <code>#Prestamo J</code> préstamo a J`);
+          }
+        } catch (e) { console.error(e); }
+      }
+      return json({ ok: true });
+    }
+
+    const msg = upd.message;
+    if (!msg) return json({ ok: true });
+    const chatId = msg.chat.id;
+    const text = (msg.text || msg.caption || '').trim();
+
+    // /start command
+    if (text.startsWith('/start') || text === '/vincular') {
+      const users = (await query('SELECT id, name, color FROM app_users ORDER BY created_at')).rows;
+      const buttons = users.map(u => [{ text: `👤 ${u.name}`, callback_data: `bind:${u.id}` }]);
+      await sendMessage(chatId,
+        `👋 <b>Bienvenido a Finanzas Pareja</b>\n\n¿Quién eres? Toca tu nombre para vincular este chat:`,
+        { reply_markup: { inline_keyboard: buttons } });
+      return json({ ok: true });
+    }
+
+    // /help
+    if (text.startsWith('/help') || text.startsWith('/ayuda')) {
+      await sendMessage(chatId,
+        `📖 <b>Comandos rápidos</b>\n\n` +
+        `<code>30$ cena #Nos J</code> — 30 USD compartido con J\n` +
+        `<code>5000 bs comida #Mio</code> — 5000 Bs personal\n` +
+        `<code>15 usd hotel #Prestamo J</code> — 15 USD prestado a J (se congela en USDT)\n` +
+        `<code>500 bs café</code> — sin hashtag = personal por defecto\n\n` +
+        `🎤 Envía nota de voz en español para transcripción automática\n` +
+        `📷 Envía captura de Pago Móvil para OCR automático`);
+      return json({ ok: true });
+    }
+
+    // Look up bound user
+    const bound = await query('SELECT id, name, telegram_chat_id FROM app_users WHERE telegram_chat_id=$1', [chatId]);
+    if (bound.rowCount === 0) {
+      await sendMessage(chatId, '⚠️ Este chat no está vinculado. Envía /start para vincularte.');
+      return json({ ok: true });
+    }
+    const me = bound.rows[0];
+
+    // Handle voice / audio
+    if (msg.voice || msg.audio) {
+      const fileId = (msg.voice || msg.audio).file_id;
+      const mime = (msg.voice || msg.audio).mime_type || 'audio/ogg';
+      try {
+        const { buffer } = await downloadFile(fileId);
+        const transcript = await transcribeAudio(buffer, 'voice.ogg', mime);
+        await sendMessage(chatId, `🎤 <i>Escuché:</i> "${transcript}"`);
+        const parsed = parseExpenseText(transcript);
+        if (!parsed) {
+          await sendMessage(chatId, '❌ No pude interpretar un gasto. Intenta: "gasté 30 dólares en cena compartido"');
+          return json({ ok: true });
+        }
+        await handleParsedExpense(me, parsed, chatId, 'WHATSAPP_BOT');
+      } catch (e) { await sendMessage(chatId, '❌ Error de transcripción: ' + e.message); }
+      return json({ ok: true });
+    }
+
+    // Handle photo (receipt OCR)
+    if (msg.photo && msg.photo.length) {
+      const largest = msg.photo[msg.photo.length - 1];
+      try {
+        const { buffer } = await downloadFile(largest.file_id);
+        const data = await extractReceipt(buffer, 'image/jpeg');
+        const amt = Number(data?.amount_bs);
+        if (!amt || !isFinite(amt) || amt <= 0) {
+          await sendMessage(chatId, `📷 No pude leer el monto claramente. Datos extraídos:\n<code>${JSON.stringify(data)}</code>`);
+          return json({ ok: true });
+        }
+        // Determine type from caption if any
+        const captionParsed = parseExpenseText(text);
+        const type = captionParsed?.type || 'MIO';
+        const description = data.description || text || `Pago ${data.bank || ''} ${data.reference ? '#'+data.reference : ''}`.trim();
+        const parsed = { amount: amt, currency: 'BS', description, type, beneficiaryHint: captionParsed?.beneficiaryHint };
+        await sendMessage(chatId, `📷 <b>OCR:</b> ${amt.toFixed(2)} Bs · ${data.bank || 'Banco'}${data.reference ? ' · Ref '+data.reference : ''}`);
+        await handleParsedExpense(me, parsed, chatId, 'OCR');
+      } catch (e) { await sendMessage(chatId, '❌ Error OCR: ' + e.message); }
+      return json({ ok: true });
+    }
+
+    // Handle text
+    if (text) {
+      const parsed = parseExpenseText(text);
+      if (!parsed) {
+        await sendMessage(chatId, '❌ No entendí. Prueba: <code>30$ cena #Nos J</code>\nEscribe /help para más ejemplos.');
+        return json({ ok: true });
+      }
+      await handleParsedExpense(me, parsed, chatId, 'WHATSAPP_BOT');
+    }
+    return json({ ok: true });
+  }
+
   if (path === '/dashboard' && method === 'GET') {
     const month = url.searchParams.get('month') || new Date().toISOString().slice(0, 7);
     const users = (await query('SELECT id, name, short, color FROM app_users ORDER BY created_at')).rows;
 
-    // Sum by type/user for the month (all-time also possible)
+    // Net debt uses ALL-TIME unreconciled transactions (settlements reset it)
     const txAgg = await query(`
       SELECT type, payer_id, beneficiary_id,
              SUM(amount_usd)::numeric AS total_usd,
              SUM(COALESCE(amount_usdt,0))::numeric AS total_usdt
       FROM transactions
-      WHERE transaction_date >= $1::date AND transaction_date < ($1::date + interval '1 month')
+      WHERE is_reconciled = FALSE
       GROUP BY type, payer_id, beneficiary_id
-    `, [month + '-01']);
+    `);
 
     // Compute balances between users (for couple mode: net debt)
     // For each user, sum of #NOS paid (they cover 50% for the other) + sum of PRESTAMO where beneficiary=other

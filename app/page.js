@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, Dialog
 import { Textarea } from '@/components/ui/textarea';
 import { Separator } from '@/components/ui/separator';
 import { toast } from 'sonner';
-import { ArrowRight, RefreshCw, Wallet, Users, TrendingUp, Trash2, Plus, Sparkles, DollarSign, Coins, Receipt, PiggyBank, Snowflake } from 'lucide-react';
+import { ArrowRight, RefreshCw, Wallet, Users, TrendingUp, Trash2, Plus, Sparkles, DollarSign, Coins, Receipt, PiggyBank, Snowflake, Send, HandCoins, CheckCircle2 } from 'lucide-react';
 
 const api = async (path, options = {}) => {
   const r = await fetch('/api' + path, {
@@ -162,7 +162,7 @@ export default function App() {
             <TabsTrigger value="config">⚙️ Ajustes</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="dashboard"><DashboardView data={dashboard} me={me} /></TabsContent>
+          <TabsContent value="dashboard"><DashboardView data={dashboard} me={me} reload={loadAll} /></TabsContent>
           <TabsContent value="new"><NewExpenseForm me={me} users={users} categories={categories} wallets={wallets} rates={rates} onSaved={loadAll} onSwitchTab={() => setTab('history')} /></TabsContent>
           <TabsContent value="history"><HistoryView transactions={transactions} onDelete={async (id) => { await api('/transactions/' + id, { method: 'DELETE' }); toast.success('Eliminado'); await loadAll(); }} /></TabsContent>
           <TabsContent value="config"><ConfigView users={users} setUsers={setUsers} wallets={wallets} categories={categories} budgets={budgets} reload={loadAll} /></TabsContent>
@@ -212,7 +212,8 @@ function RatesPill({ rates, refreshing, onRefresh }) {
 }
 
 // ------ DASHBOARD ------
-function DashboardView({ data, me }) {
+function DashboardView({ data, me, reload }) {
+  const [settleOpen, setSettleOpen] = useState(false);
   if (!data) return <div className="text-muted-foreground">Cargando...</div>;
   const { net, totals, budgets, rates } = data;
 
@@ -224,7 +225,7 @@ function DashboardView({ data, me }) {
           <CardContent className="p-6">
             <div className="mb-2 flex items-center gap-2 text-white/80"><Snowflake size={16} /> <span className="text-xs uppercase tracking-wider">Deuda neta actual</span></div>
             {Number(net.amount_usd) < 0.01 ? (
-              <div className="text-2xl font-bold">✨ Están al día · $0.00</div>
+              <div className="flex items-center gap-3"><CheckCircle2 size={28} /><div className="text-2xl font-bold">Están al día · $0.00</div></div>
             ) : (
               <>
                 <div className="text-3xl md:text-4xl font-bold">
@@ -234,9 +235,15 @@ function DashboardView({ data, me }) {
                   <div><span className="text-4xl font-black">${fmtNum(net.amount_usd)}</span><span className="ml-1 text-white/70">USD</span></div>
                   <div className="flex items-center gap-1 rounded-full bg-white/15 px-3 py-1 text-sm"><Coins size={14} /> {fmtNum(net.amount_usdt)} USDT · congelado</div>
                 </div>
+                <div className="mt-4">
+                  <Button variant="secondary" className="bg-white text-indigo-700 hover:bg-white/90" onClick={() => setSettleOpen(true)}>
+                    <HandCoins size={16} className="mr-2" /> Liquidar deuda · borrón y cuenta nueva
+                  </Button>
+                </div>
               </>
             )}
           </CardContent>
+          <SettleDialog open={settleOpen} setOpen={setSettleOpen} net={net} onDone={reload} />
         </Card>
       )}
 
@@ -528,10 +535,119 @@ function HistoryView({ transactions, onDelete }) {
 // ------ CONFIG ------
 function ConfigView({ users, wallets, categories, budgets, reload }) {
   return (
-    <div className="grid gap-4 md:grid-cols-2">
-      <WalletsSection users={users} wallets={wallets} reload={reload} />
-      <BudgetsSection categories={categories} users={users} budgets={budgets} reload={reload} />
+    <div className="space-y-4">
+      <TelegramSection users={users} reload={reload} />
+      <div className="grid gap-4 md:grid-cols-2">
+        <WalletsSection users={users} wallets={wallets} reload={reload} />
+        <BudgetsSection categories={categories} users={users} budgets={budgets} reload={reload} />
+      </div>
     </div>
+  );
+}
+
+function TelegramSection({ users, reload }) {
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { api('/telegram/status').then(setStatus).catch(() => {}); }, []);
+  const botLink = 'https://t.me/Finanzas_ParejaJM_Bot';
+  const bound = users.filter(u => u.telegram_chat_id);
+  const setupWebhook = async () => {
+    setBusy(true);
+    try { await api('/telegram/setup', { method: 'POST' }); toast.success('Webhook activado'); const s = await api('/telegram/status'); setStatus(s); }
+    catch (e) { toast.error(e.message); } finally { setBusy(false); }
+  };
+  const unbind = async (uid) => { await api('/telegram/unbind', { method: 'POST', body: JSON.stringify({ user_id: uid }) }); toast.success('Desvinculado'); await reload(); };
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start justify-between">
+        <div>
+          <CardTitle className="flex items-center gap-2"><Send size={18} /> Bot de Telegram</CardTitle>
+          <CardDescription>Registra gastos por chat, voz o captura de Pago Móvil (OCR)</CardDescription>
+        </div>
+        <div className="flex items-center gap-2">
+          {status?.info?.url ? <Badge className="bg-emerald-100 text-emerald-800">Webhook activo</Badge> : <Badge variant="outline">Sin webhook</Badge>}
+          <Button size="sm" variant="outline" onClick={setupWebhook} disabled={busy}>{busy ? 'Configurando...' : 'Activar/Reconectar'}</Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4">
+          <div className="text-sm font-semibold mb-1">📲 Cómo vincularse</div>
+          <ol className="list-decimal list-inside text-sm space-y-1 text-slate-700">
+            <li>Abrir el bot: <a href={botLink} target="_blank" rel="noreferrer" className="text-indigo-600 underline font-medium">@Finanzas_ParejaJM_Bot</a></li>
+            <li>Enviar el comando <code className="bg-white px-1.5 py-0.5 rounded text-xs">/start</code></li>
+            <li>Tocar tu nombre en los botones</li>
+            <li>Empezar a enviar gastos 🎉</li>
+          </ol>
+        </div>
+
+        <div className="rounded-lg border p-3 text-sm">
+          <div className="font-medium mb-2">✍️ Sintaxis rápida</div>
+          <div className="space-y-1 text-slate-600 text-xs font-mono">
+            <div><b>30$ cena #Nos J</b> · 30 USD compartido con J</div>
+            <div><b>5000 bs comida #Mio</b> · 5000 Bs personal</div>
+            <div><b>15 usd hotel #Prestamo J</b> · 15 USD prestado a J (congela USDT)</div>
+            <div><b>🎤 Nota de voz</b> en español · transcripción automática</div>
+            <div><b>📷 Foto de Pago Móvil</b> · OCR automático</div>
+          </div>
+        </div>
+
+        <div>
+          <div className="text-sm font-medium mb-2">Vinculaciones actuales</div>
+          {bound.length === 0 && <div className="text-xs text-muted-foreground">Nadie vinculado aún. Envía /start al bot.</div>}
+          <div className="space-y-1">
+            {bound.map(u => (
+              <div key={u.id} className="flex items-center justify-between rounded border px-3 py-2 text-sm">
+                <span>✅ <b>{u.name}</b> · chat #{u.telegram_chat_id}</span>
+                <Button size="sm" variant="ghost" onClick={() => unbind(u.id)}>Desvincular</Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function SettleDialog({ open, setOpen, net, onDone }) {
+  const [notes, setNotes] = useState('');
+  const [saving, setSaving] = useState(false);
+  if (!net) return null;
+  const submit = async () => {
+    setSaving(true);
+    try {
+      await api('/settlements', { method: 'POST', body: JSON.stringify({
+        payer_id: net.from.id, receiver_id: net.to.id, amount_usd: net.amount_usd, notes,
+      })});
+      toast.success('✨ Deuda liquidada · borrón y cuenta nueva');
+      setOpen(false); setNotes('');
+      await onDone();
+    } catch (e) { toast.error(e.message); }
+    finally { setSaving(false); }
+  };
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>Liquidar deuda</DialogTitle></DialogHeader>
+        <div className="space-y-3">
+          <div className="rounded-lg bg-gradient-to-br from-indigo-50 to-fuchsia-50 border p-4 text-center">
+            <div className="text-xs text-muted-foreground">{net.from.name} le paga a {net.to.name}</div>
+            <div className="text-3xl font-black mt-1">${fmtNum(net.amount_usd)}</div>
+            <div className="text-xs text-fuchsia-600 mt-1">≈ {fmtNum(net.amount_usdt)} USDT</div>
+          </div>
+          <div>
+            <Label>Notas (opcional)</Label>
+            <Textarea placeholder="Ej: Transferencia Binance · TxID XXX" value={notes} onChange={e => setNotes(e.target.value)} rows={2} />
+          </div>
+          <p className="text-xs text-muted-foreground">Se marcarán como conciliadas todas las transacciones #Nos y #Prestamo pendientes entre {net.from.name} y {net.to.name}.</p>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => setOpen(false)}>Cancelar</Button>
+          <Button className="bg-gradient-to-r from-indigo-500 to-fuchsia-500" disabled={saving} onClick={submit}>
+            {saving ? 'Liquidando...' : '💸 Confirmar liquidación'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
