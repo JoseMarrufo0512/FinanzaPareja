@@ -13,7 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, Dialog
 import { Textarea } from '@/components/ui/textarea';
 import { Separator } from '@/components/ui/separator';
 import { toast } from 'sonner';
-import { ArrowRight, RefreshCw, Wallet, Users, TrendingUp, Trash2, Plus, Sparkles, DollarSign, Coins, Receipt, PiggyBank, Snowflake, Send, HandCoins, CheckCircle2 } from 'lucide-react';
+import { ArrowRight, RefreshCw, Wallet, Users, TrendingUp, Trash2, Plus, Sparkles, DollarSign, Coins, Receipt, PiggyBank, Snowflake, Send, HandCoins, CheckCircle2, LogOut, Lock } from 'lucide-react';
 
 const api = async (path, options = {}) => {
   const r = await fetch('/api' + path, {
@@ -47,6 +47,7 @@ export default function App() {
   const [budgets, setBudgets] = useState([]);
   const [rates, setRates] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [authStatus, setAuthStatus] = useState(null);
 
   // ------ ONBOARDING ------
   const [needsOnboard, setNeedsOnboard] = useState(false);
@@ -58,6 +59,9 @@ export default function App() {
 
   async function boot() {
     try {
+      const st = await api('/auth/status');
+      setAuthStatus(st);
+      if (!st.authenticated) { setReady(true); return; }
       const us = await api('/users');
       if (!us || us.length === 0) {
         setNeedsOnboard(true);
@@ -74,6 +78,13 @@ export default function App() {
       toast.error('Error inicial: ' + e.message);
       setReady(true);
     }
+  }
+
+  async function logout() {
+    try { await api('/auth/logout', { method: 'POST' }); } catch {}
+    setAuthStatus({ pin_set: true, authenticated: false });
+    setNeedsOnboard(false);
+    setReady(true);
   }
 
   async function completeOnboard() {
@@ -112,6 +123,10 @@ export default function App() {
 
   // ------ ONBOARDING VIEW ------
   if (!ready) return <div className="flex min-h-screen items-center justify-center text-muted-foreground">Cargando...</div>;
+
+  if (authStatus && !authStatus.authenticated) {
+    return <AuthGate pinSet={authStatus.pin_set} onAuthed={async () => { setReady(false); await boot(); }} />;
+  }
 
   if (needsOnboard) {
     return (
@@ -152,7 +167,7 @@ export default function App() {
   // ------ MAIN LAYOUT ------
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-indigo-50">
-      <Header users={users} me={me} switchMe={switchMe} rates={rates} refreshing={refreshing} onRefresh={refreshRates} />
+      <Header users={users} me={me} switchMe={switchMe} rates={rates} refreshing={refreshing} onRefresh={refreshRates} onLogout={logout} />
       <main className="container mx-auto max-w-6xl px-4 py-6">
         <Tabs value={tab} onValueChange={setTab} className="space-y-4">
           <TabsList className="grid w-full grid-cols-4">
@@ -173,7 +188,7 @@ export default function App() {
 }
 
 // ------ HEADER ------
-function Header({ users, me, switchMe, rates, refreshing, onRefresh }) {
+function Header({ users, me, switchMe, rates, refreshing, onRefresh, onLogout }) {
   return (
     <header className="border-b bg-white/70 backdrop-blur-sm sticky top-0 z-40">
       <div className="container mx-auto max-w-6xl flex items-center justify-between px-4 py-3">
@@ -194,9 +209,68 @@ function Header({ users, me, switchMe, rates, refreshing, onRefresh }) {
               </SelectContent>
             </Select>
           )}
+          {onLogout && (
+            <Button variant="ghost" size="icon" className="h-9 w-9" title="Cerrar sesión" onClick={onLogout}>
+              <LogOut size={16} />
+            </Button>
+          )}
         </div>
       </div>
     </header>
+  );
+}
+
+// ------ AUTH GATE ------
+function AuthGate({ pinSet, onAuthed }) {
+  const [pin, setPin] = useState('');
+  const [pin2, setPin2] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function submit() {
+    if (!pin || pin.trim().length < 4) { toast.error('El PIN debe tener al menos 4 caracteres'); return; }
+    if (!pinSet && pin !== pin2) { toast.error('Los PIN no coinciden'); return; }
+    setLoading(true);
+    try {
+      await api(pinSet ? '/auth/login' : '/auth/setup', { method: 'POST', body: JSON.stringify({ pin }) });
+      toast.success(pinSet ? 'Bienvenido de nuevo 💜' : 'PIN creado con éxito');
+      await onAuthed();
+    } catch (e) { toast.error(e.message); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 p-4">
+      <Card className="w-full max-w-sm border-indigo-100 shadow-xl">
+        <CardHeader>
+          <div className="mb-2 flex justify-center"><div className="rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-3 text-white"><Lock size={26} /></div></div>
+          <CardTitle className="text-center text-xl">{pinSet ? 'Ingresa tu PIN' : 'Crea un PIN de acceso'}</CardTitle>
+          <CardDescription className="text-center">
+            {pinSet ? 'Introduce la clave compartida para entrar' : 'Protege tus finanzas con una clave que ambos compartan'}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div>
+            <Label>PIN</Label>
+            <Input type="password" inputMode="numeric" autoFocus value={pin}
+              onChange={e => setPin(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && pinSet) submit(); }}
+              placeholder="••••" />
+          </div>
+          {!pinSet && (
+            <div>
+              <Label>Confirma el PIN</Label>
+              <Input type="password" inputMode="numeric" value={pin2}
+                onChange={e => setPin2(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+                placeholder="••••" />
+            </div>
+          )}
+          <Button className="w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 hover:opacity-90" onClick={submit} disabled={loading}>
+            {loading ? 'Un momento...' : (pinSet ? 'Entrar' : 'Crear PIN y entrar')}
+          </Button>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 

@@ -6,6 +6,7 @@ import { D, fmt } from '@/lib/money';
 import { parseExpenseText } from '@/lib/parser';
 import { tg, sendMessage, answerCallback, downloadFile, setWebhook, getWebhookInfo } from '@/lib/telegram';
 import { transcribeAudio, extractReceipt, suggestCategory } from '@/lib/ai';
+import { hashPin, verifyPin, newToken, safeEqual } from '@/lib/auth';
 import { startScheduler } from '@/lib/scheduler';
 
 Decimal.set({ precision: 30, rounding: Decimal.ROUND_HALF_UP });
@@ -145,6 +146,33 @@ async function ensureInit() {
   await initDb();
 }
 
+const SESSION_COOKIE = 'sid';
+const SESSION_DAYS = 30;
+
+async function getSession(req) {
+  const token = req.cookies?.get(SESSION_COOKIE)?.value;
+  if (!token) return null;
+  const r = await query('SELECT token, expires_at FROM auth_sessions WHERE token=$1', [token]);
+  if (!r.rowCount) return null;
+  if (new Date(r.rows[0].expires_at) < new Date()) {
+    await query('DELETE FROM auth_sessions WHERE token=$1', [token]);
+    return null;
+  }
+  return r.rows[0];
+}
+
+function setSessionCookie(res, token) {
+  res.cookies.set(SESSION_COOKIE, token, {
+    httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 60 * 60 * 24 * SESSION_DAYS,
+  });
+  return res;
+}
+
+async function pinIsSet() {
+  const r = await query("SELECT value FROM app_settings WHERE key='access_pin_hash'");
+  return r.rowCount > 0 && !!r.rows[0].value;
+}
+
 // ---------- ROUTE DISPATCH ----------
 async function dispatch(req, params) {
   const method = req.method;
@@ -152,6 +180,47 @@ async function dispatch(req, params) {
   const url = new URL(req.url);
 
   await ensureInit();
+
+  // -------- AUTH ENDPOINTS (public) --------
+  if (path === '/auth/status' && method === 'GET') {
+    const pin_set = await pinIsSet();
+    const sess = await getSession(req);
+    return json({ pin_set, authenticated: !!sess });
+  }
+  if (path === '/auth/setup' && method === 'POST') {
+    if (await pinIsSet()) return err('El PIN ya fue configurado. Usa iniciar sesión.', 409);
+    const b = await req.json().catch(() => ({}));
+    const pin = (b.pin || '').toString().trim();
+    if (pin.length < 4) return err('El PIN debe tener al menos 4 caracteres', 422);
+    await query("INSERT INTO app_settings(key,value) VALUES('access_pin_hash',$1) ON CONFLICT(key) DO UPDATE SET value=$1", [hashPin(pin)]);
+    const token = newToken();
+    await query("INSERT INTO auth_sessions(token, expires_at) VALUES($1, NOW() + interval '30 days')", [token]);
+    return setSessionCookie(json({ ok: true, authenticated: true }, 201), token);
+  }
+  if (path === '/auth/login' && method === 'POST') {
+    const b = await req.json().catch(() => ({}));
+    const pin = (b.pin || '').toString().trim();
+    const r = await query("SELECT value FROM app_settings WHERE key='access_pin_hash'");
+    if (!r.rowCount || !r.rows[0].value) return err('No hay PIN configurado', 400);
+    if (!verifyPin(pin, r.rows[0].value)) return err('PIN incorrecto', 401);
+    const token = newToken();
+    await query("INSERT INTO auth_sessions(token, expires_at) VALUES($1, NOW() + interval '30 days')", [token]);
+    return setSessionCookie(json({ ok: true, authenticated: true }), token);
+  }
+  if (path === '/auth/logout' && method === 'POST') {
+    const token = req.cookies?.get(SESSION_COOKIE)?.value;
+    if (token) await query('DELETE FROM auth_sessions WHERE token=$1', [token]);
+    const res = json({ ok: true });
+    res.cookies.set(SESSION_COOKIE, '', { httpOnly: true, path: '/', maxAge: 0 });
+    return res;
+  }
+
+  // -------- AUTH GATE (everything except public routes) --------
+  const isPublic = path === '/health' || path === '/webhooks/telegram' || path.startsWith('/auth/');
+  if (!isPublic) {
+    const sess = await getSession(req);
+    if (!sess) return err('No autorizado', 401);
+  }
 
   // Auto-refresh rates if none exist yet
   if (path !== '/rates/refresh' && path !== '/init') {
@@ -190,9 +259,11 @@ async function dispatch(req, params) {
   }
   if (path === '/users' && method === 'POST') {
     const b = await req.json();
+    if (!b.name || !b.name.toString().trim()) return err('Nombre requerido', 422);
+    const name = b.name.toString().trim().slice(0, 50);
     const r = await query(
       'INSERT INTO app_users(name,short,color) VALUES($1,$2,$3) RETURNING *',
-      [b.name, (b.short || b.name[0]).toUpperCase().slice(0, 3), b.color || '#6366f1']
+      [name, (b.short || name[0]).toUpperCase().slice(0, 3), b.color || '#6366f1']
     );
     return json(r.rows[0], 201);
   }
@@ -293,7 +364,11 @@ async function dispatch(req, params) {
 
   if (path === '/transactions' && method === 'POST') {
     const b = await req.json();
-    if (!b.payer_id || !b.type || !b.original_amount || !b.original_currency) return err('Faltan campos', 422);
+    if (!b.payer_id || !b.type || b.original_amount === undefined || !b.original_currency) return err('Faltan campos', 422);
+    const amt = Number(b.original_amount);
+    if (!isFinite(amt) || amt <= 0 || amt > 1e12) return err('Monto inválido', 422);
+    if (!['NOS', 'MIO', 'PRESTAMO'].includes(b.type)) return err('Tipo inválido', 422);
+    if (!['USD', 'BS', 'EUR', 'USDT'].includes(b.original_currency)) return err('Moneda inválida', 422);
     if (b.type === 'PRESTAMO' && !b.beneficiary_id) return err('Préstamo requiere beneficiario', 422);
     const tx = await createTransaction(b);
     notifyPartner(tx).catch(() => {});
@@ -335,6 +410,9 @@ async function dispatch(req, params) {
   // -------- SETTLEMENTS --------
   if (path === '/settlements' && method === 'POST') {
     const b = await req.json();
+    if (!b.payer_id || !b.receiver_id) return err('Faltan participantes', 422);
+    const amtNum = Number(b.amount_usd);
+    if (!isFinite(amtNum) || amtNum <= 0 || amtNum > 1e12) return err('Monto inválido', 422);
     const rates = await getLatestRates();
     const binUsdt = D(rates.binance_usdt?.rate || 0);
     const bcvUsd = D(rates.bcv_usd?.rate || 0);
@@ -395,7 +473,7 @@ async function dispatch(req, params) {
 
   if (path === '/webhooks/telegram' && method === 'POST') {
     const secret = req.headers.get('x-telegram-bot-api-secret-token');
-    if (secret !== process.env.TELEGRAM_WEBHOOK_SECRET) return json({ ok: true }); // silently ignore
+    if (!safeEqual(secret, process.env.TELEGRAM_WEBHOOK_SECRET)) return json({ ok: true }); // silently ignore
     const upd = await req.json().catch(() => ({}));
 
     // Callback query for user binding
@@ -472,7 +550,7 @@ async function dispatch(req, params) {
           return json({ ok: true });
         }
         await handleParsedExpense(me, parsed, chatId, 'WHATSAPP_BOT');
-      } catch (e) { await sendMessage(chatId, '❌ Error de transcripción: ' + e.message); }
+      } catch (e) { console.error('voice', e.message); await sendMessage(chatId, '❌ No pude procesar el audio. Intenta de nuevo o escríbelo.'); }
       return json({ ok: true });
     }
 
@@ -484,7 +562,7 @@ async function dispatch(req, params) {
         const data = await extractReceipt(buffer, 'image/jpeg');
         const amt = Number(data?.amount_bs);
         if (!amt || !isFinite(amt) || amt <= 0) {
-          await sendMessage(chatId, `📷 No pude leer el monto claramente. Datos extraídos:\n<code>${JSON.stringify(data)}</code>`);
+          await sendMessage(chatId, `📷 No pude leer el monto claramente. Intenta con una foto más nítida o escribe el gasto.`);
           return json({ ok: true });
         }
         // Determine type from caption if any
@@ -494,7 +572,7 @@ async function dispatch(req, params) {
         const parsed = { amount: amt, currency: 'BS', description, type, beneficiaryHint: captionParsed?.beneficiaryHint };
         await sendMessage(chatId, `📷 <b>OCR:</b> ${amt.toFixed(2)} Bs · ${data.bank || 'Banco'}${data.reference ? ' · Ref '+data.reference : ''}`);
         await handleParsedExpense(me, parsed, chatId, 'OCR');
-      } catch (e) { await sendMessage(chatId, '❌ Error OCR: ' + e.message); }
+      } catch (e) { console.error('ocr', e.message); await sendMessage(chatId, '❌ No pude procesar la imagen. Intenta de nuevo.'); }
       return json({ ok: true });
     }
 
@@ -610,17 +688,17 @@ async function dispatch(req, params) {
 // Handlers
 export async function GET(req, ctx) {
   try { return await dispatch(req, await ctx.params); }
-  catch (e) { console.error(e); return err(e.message || 'Error interno', 500); }
+  catch (e) { console.error(e); return err('Error interno del servidor', 500); }
 }
 export async function POST(req, ctx) {
   try { return await dispatch(req, await ctx.params); }
-  catch (e) { console.error(e); return err(e.message || 'Error interno', 500); }
+  catch (e) { console.error(e); return err('Error interno del servidor', 500); }
 }
 export async function PATCH(req, ctx) {
   try { return await dispatch(req, await ctx.params); }
-  catch (e) { console.error(e); return err(e.message || 'Error interno', 500); }
+  catch (e) { console.error(e); return err('Error interno del servidor', 500); }
 }
 export async function DELETE(req, ctx) {
   try { return await dispatch(req, await ctx.params); }
-  catch (e) { console.error(e); return err(e.message || 'Error interno', 500); }
+  catch (e) { console.error(e); return err('Error interno del servidor', 500); }
 }

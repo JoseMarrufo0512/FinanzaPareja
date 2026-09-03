@@ -63,3 +63,47 @@ Tested via `/app/backend_test.py`:
 **Test Cleanup:** All 5 test transactions successfully deleted via DELETE /api/transactions/:id
 
 **Status:** AI auto-categorization feature is **FULLY FUNCTIONAL** and working as designed.
+
+## Fase 2 - Seguridad (NUEVO)
+- SEC-001 [CRITICO] Auth gate por PIN compartido + sesion por cookie (httpOnly). PIN de prueba: 246810 (ver test_credentials.md)
+  - Rutas publicas: /api/health, /api/webhooks/telegram, /api/auth/*
+  - Todas las demas requieren cookie de sesion valida -> 401 sin sesion
+  - Endpoints: /api/auth/status (GET), /api/auth/setup (POST), /api/auth/login (POST), /api/auth/logout (POST)
+- SEC-002 Validacion de entrada en POST /transactions (monto>0 y <=1e12, type enum, currency enum), /users (name requerido), /settlements (amount_usd>0)
+- SEC-003 Errores genericos: handlers devuelven "Error interno del servidor"; bot ya no filtra e.message ni JSON crudo
+- Hardening: compare constante webhook secret; headers nosniff/referrer/permissions
+
+### Backend Security Testing Results (2026-09-03)
+
+**✅ ALL SECURITY TESTS PASSED (16/16)**
+
+Tested via `/app/security_test.py`:
+
+**🔐 AUTH TESTS (SEC-001): 8/8 PASSED**
+
+1. ✅ **Health Check (public)** - GET /api/health returns 200 without auth
+2. ✅ **Auth Status (public)** - GET /api/auth/status returns {pin_set:true, authenticated:false} without cookie
+3. ✅ **Protected Routes 401** - GET /api/users, /api/transactions, /api/dashboard, /api/budgets all return 401 without session cookie
+4. ✅ **Wrong PIN Rejected** - POST /api/auth/login with PIN "000000" returns 401 with error "PIN incorrecto"
+5. ✅ **Correct PIN Login** - POST /api/auth/login with PIN "246810" returns 200 and sets httpOnly "sid" cookie
+6. ✅ **Authenticated Access** - With session cookie: GET /api/users returns 200 (2 users), GET /api/dashboard returns 200
+7. ✅ **Logout Works** - POST /api/auth/logout returns 200, then GET /api/users returns 401 (session invalidated)
+8. ✅ **Re-login Works** - Can successfully re-authenticate with correct PIN
+
+**✅ INPUT VALIDATION TESTS (SEC-002): 5/5 PASSED**
+
+9. ✅ **Negative Amount Rejected** - POST /api/transactions with original_amount="-5" returns 422 "Monto inválido"
+10. ✅ **Invalid Currency Rejected** - POST /api/transactions with original_currency="XXX" returns 422 "Moneda inválida"
+11. ✅ **Invalid Type Rejected** - POST /api/transactions with type="FOO" returns 422 "Tipo inválido"
+12. ✅ **Missing Name Rejected** - POST /api/users with empty body returns 422 "Nombre requerido"
+13. ✅ **Negative Settlement Rejected** - POST /api/settlements with amount_usd="-1" returns 422 "Monto inválido"
+
+**🤖 AI CATEGORIZATION REGRESSION (authenticated): 3/3 PASSED**
+
+14. ✅ **Auto-Categorize Restaurant** - POST transaction "cena en restaurante italiano" with NO category_id → correctly assigned to **Comida** category (AI working with auth)
+15. ✅ **Explicit Category Respected** - POST transaction with explicit category_id="Otros" + description "cena restaurante" → category NOT overwritten by AI (correctly kept as Otros)
+16. ✅ **Opt-out Auto-Categorize** - POST transaction with auto_categorize=false → category_id remains null as expected
+
+**Test Cleanup:** All 3 test transactions successfully deleted via DELETE /api/transactions/:id (authenticated)
+
+**Status:** Security features (SEC-001, SEC-002) are **FULLY FUNCTIONAL**. AI categorization continues to work correctly with authentication enabled.
