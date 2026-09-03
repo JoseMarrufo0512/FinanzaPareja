@@ -107,3 +107,57 @@ Tested via `/app/security_test.py`:
 **Test Cleanup:** All 3 test transactions successfully deleted via DELETE /api/transactions/:id (authenticated)
 
 **Status:** Security features (SEC-001, SEC-002) are **FULLY FUNCTIONAL**. AI categorization continues to work correctly with authentication enabled.
+
+## Fase 2 - Auth Flow Verification (NUEVO)
+
+### Auth Flow Testing Results (2026-09-03)
+
+**✅ ALL AUTH FLOW TESTS PASSED (16/16)**
+
+Tested via `/app/auth_flow_test.py` with PIN "1234":
+
+**✅ TEST 1: HEALTH CHECK (1/1 PASSED)**
+
+1. ✅ **Health Check** - GET /api/health returns 200 with {ok: true, ts: timestamp}
+
+**✅ TEST 2: AUTH FLOW (3/3 PASSED)**
+
+2. ✅ **Auth Status (unauthenticated)** - GET /api/auth/status returns {pin_set: true, authenticated: false}
+3. ✅ **Auth Login** - POST /api/auth/login with {"pin": "1234"} returns 200 and sets "sid" cookie
+4. ✅ **Auth Status (authenticated)** - GET /api/auth/status with cookie returns {pin_set: true, authenticated: true}
+
+**✅ TEST 3: PROTECTED ROUTES WITH AUTH (5/5 PASSED)**
+
+5. ✅ **GET /api/users** - Returns array with 2 users (José, Aliexis) with valid UUIDs
+6. ✅ **GET /api/categories** - Returns array with 10 categories (Cashea, Comida, Farmacia, Hotel, Moto, etc.)
+7. ✅ **GET /api/dashboard** - Returns dashboard data with all required fields: net, totals, budgets, rates
+8. ✅ **GET /api/rates** - Returns exchange rates object with bcv_usd (804.81), binance_usdt (984.64)
+9. ✅ **GET /api/transactions?limit=10** - Returns transactions array (0 transactions initially)
+
+**✅ TEST 4: PROTECTED ROUTES WITHOUT AUTH (2/2 PASSED)**
+
+10. ✅ **GET /api/users (no cookie)** - Returns 401 as expected
+11. ✅ **GET /api/dashboard (no cookie)** - Returns 401 as expected
+
+**✅ TEST 5: TRANSACTION CREATION WITH AUTH (3/3 PASSED)**
+
+12. ✅ **Valid Transaction** - POST /api/transactions with valid data (payer_id, type: MIO, amount: 25.50 USD, description) returns 201 with transaction id
+13. ✅ **Missing Fields** - POST /api/transactions with missing payer_id and currency returns 422 "Faltan campos"
+14. ✅ **Negative Amount** - POST /api/transactions with amount: -10 returns 422 "Monto inválido"
+
+**✅ TEST 6: LOGOUT FLOW (2/2 PASSED)**
+
+15. ✅ **Logout** - POST /api/auth/logout with cookie returns 200
+16. ✅ **After Logout** - GET /api/users after logout returns 401 (session invalidated)
+
+**Test Cleanup:** 1 test transaction successfully deleted via DELETE /api/transactions/:id (authenticated)
+
+**Status:** All authentication flows, protected routes, and transaction validation are **FULLY FUNCTIONAL** with PIN "1234". The backend API correctly enforces authentication via httpOnly "sid" cookie and validates all inputs.
+
+**Key Findings:**
+- ✅ Public routes (health, auth/status, auth/login, auth/logout) accessible without authentication
+- ✅ Protected routes (users, categories, dashboard, rates, transactions) require valid session cookie
+- ✅ Session management working correctly (login sets cookie, logout invalidates session)
+- ✅ Input validation working for transactions (negative amounts, missing fields rejected with 422)
+- ✅ Exchange rates auto-refresh working (BCV USD: 804.81, Binance USDT: 984.64)
+- ✅ Transaction CRUD operations working with proper authentication

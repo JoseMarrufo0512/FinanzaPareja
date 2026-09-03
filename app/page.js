@@ -1,20 +1,26 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Progress } from '@/components/ui/progress';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from '@/components/ui/dialog';
 import { Textarea } from '@/components/ui/textarea';
 import { Separator } from '@/components/ui/separator';
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import { toast } from 'sonner';
-import { ArrowRight, RefreshCw, Wallet, Users, TrendingUp, Trash2, Plus, Sparkles, DollarSign, Coins, Receipt, PiggyBank, Snowflake, Send, HandCoins, CheckCircle2, LogOut, Lock } from 'lucide-react';
+import {
+  ArrowRight, RefreshCw, Wallet, Users, TrendingUp, Trash2, Plus,
+  Sparkles, DollarSign, Coins, Receipt, PiggyBank, Snowflake, Send,
+  HandCoins, CheckCircle2, LogOut, Lock, LayoutDashboard, PlusCircle,
+  Clock, Settings, Eye, EyeOff, ChevronDown, Menu, X
+} from 'lucide-react';
 
+/* ─── helpers ─── */
 const api = async (path, options = {}) => {
   const r = await fetch('/api' + path, {
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
@@ -27,14 +33,125 @@ const api = async (path, options = {}) => {
 
 const CURRENCIES = ['USD', 'BS', 'EUR', 'USDT'];
 const TX_TYPES = [
-  { code: 'NOS', label: '#Nos · Compartido 50/50', desc: 'Se divide entre ambos', color: 'bg-indigo-500' },
-  { code: 'MIO', label: '#Mio · Personal', desc: 'Solo mi gasto', color: 'bg-slate-500' },
-  { code: 'PRESTAMO', label: '#Prestamo · Congelado en USDT', desc: 'Se convierte a USDT al instante', color: 'bg-fuchsia-500' },
+  { code: 'NOS', label: '#Nos', fullLabel: '#Nos · Compartido 50/50', desc: 'Se divide entre ambos', color: 'bg-indigo-500', icon: '👫' },
+  { code: 'MIO', label: '#Mio', fullLabel: '#Mio · Personal', desc: 'Solo mi gasto', color: 'bg-slate-500', icon: '🧑' },
+  { code: 'PRESTAMO', label: '#Prestamo', fullLabel: '#Prestamo · Congelado USDT', desc: 'Se convierte a USDT', color: 'bg-fuchsia-500', icon: '❄️' },
 ];
 
 function currencySymbol(c) { return { USD: '$', BS: 'Bs.', EUR: '€', USDT: '₮' }[c] || c; }
 function fmtNum(v, d = 2) { const n = Number(v || 0); return n.toLocaleString('es-VE', { minimumFractionDigits: d, maximumFractionDigits: d }); }
 
+/* ─── BOTTOM NAV ITEMS ─── */
+const NAV_ITEMS = [
+  { key: 'dashboard', label: 'Inicio', icon: LayoutDashboard },
+  { key: 'new', label: 'Nuevo', icon: PlusCircle },
+  { key: 'history', label: 'Historial', icon: Clock },
+  { key: 'config', label: 'Ajustes', icon: Settings },
+];
+
+/* ══════════════════════════════════════════════
+   AUTH GATE
+   ══════════════════════════════════════════════ */
+function AuthGate({ pinSet, onAuthed }) {
+  const [pin, setPin] = useState('');
+  const [pin2, setPin2] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [showPin, setShowPin] = useState(false);
+
+  async function submit() {
+    if (!pin || pin.trim().length < 4) { toast.error('El PIN debe tener al menos 4 caracteres'); return; }
+    if (!pinSet && pin !== pin2) { toast.error('Los PIN no coinciden'); return; }
+    setLoading(true);
+    try {
+      await api(pinSet ? '/auth/login' : '/auth/setup', { method: 'POST', body: JSON.stringify({ pin }) });
+      toast.success(pinSet ? 'Bienvenido de nuevo 💜' : 'PIN creado con éxito');
+      await onAuthed();
+    } catch (e) { toast.error(e.message); }
+    finally { setLoading(false); }
+  }
+
+  return (
+    <div className="flex min-h-[100dvh] items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 px-4 py-8">
+      <div className="w-full max-w-sm">
+        {/* Logo */}
+        <div className="mb-8 flex flex-col items-center">
+          <div className="rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-4 text-white shadow-lg shadow-indigo-500/25">
+            <Wallet size={32} />
+          </div>
+          <h1 className="mt-4 text-xl font-bold text-slate-900">Finanzas Pareja</h1>
+          <p className="text-sm text-muted-foreground">Control compartido de gastos</p>
+        </div>
+
+        <Card className="border-slate-200/60 shadow-xl shadow-slate-200/50">
+          <CardHeader className="pb-4">
+            <CardTitle className="text-center text-lg">
+              {pinSet ? '🔐 Ingresa tu PIN' : '🔑 Crea un PIN de acceso'}
+            </CardTitle>
+            <CardDescription className="text-center text-sm">
+              {pinSet
+                ? 'Introduce la clave compartida para entrar'
+                : 'Protege tus finanzas con una clave compartida'}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div>
+              <Label className="text-sm">PIN</Label>
+              <div className="relative mt-1.5">
+                <Input
+                  type={showPin ? 'text' : 'password'}
+                  inputMode="numeric"
+                  autoFocus
+                  value={pin}
+                  onChange={e => setPin(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && pinSet) submit(); }}
+                  placeholder="••••"
+                  className="h-12 text-center text-lg tracking-[0.3em] pr-12"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPin(!showPin)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                >
+                  {showPin ? <EyeOff size={18} /> : <Eye size={18} />}
+                </button>
+              </div>
+            </div>
+            {!pinSet && (
+              <div>
+                <Label className="text-sm">Confirma el PIN</Label>
+                <Input
+                  type={showPin ? 'text' : 'password'}
+                  inputMode="numeric"
+                  value={pin2}
+                  onChange={e => setPin2(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+                  placeholder="••••"
+                  className="mt-1.5 h-12 text-center text-lg tracking-[0.3em]"
+                />
+              </div>
+            )}
+            <Button
+              className="h-12 w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 text-base font-semibold hover:opacity-90"
+              onClick={submit}
+              disabled={loading}
+            >
+              {loading ? (
+                <RefreshCw size={18} className="mr-2 animate-spin" />
+              ) : (
+                <Lock size={18} className="mr-2" />
+              )}
+              {loading ? 'Un momento...' : (pinSet ? 'Entrar' : 'Crear PIN y entrar')}
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════
+   MAIN APP
+   ══════════════════════════════════════════════ */
 export default function App() {
   const [ready, setReady] = useState(false);
   const [users, setUsers] = useState([]);
@@ -49,7 +166,7 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [authStatus, setAuthStatus] = useState(null);
 
-  // ------ ONBOARDING ------
+  // Onboarding
   const [needsOnboard, setNeedsOnboard] = useState(false);
   const [mode, setMode] = useState('couple');
   const [name1, setName1] = useState('José');
@@ -111,8 +228,11 @@ export default function App() {
 
   async function refreshRates() {
     setRefreshing(true);
-    try { const r = await api('/rates/refresh', { method: 'POST' }); setRates(r.latest); toast.success('Tasas actualizadas'); }
-    catch (e) { toast.error(e.message); }
+    try {
+      const r = await api('/rates/refresh', { method: 'POST' });
+      setRates(r.latest);
+      toast.success('Tasas actualizadas');
+    } catch (e) { toast.error(e.message); }
     finally { setRefreshing(false); }
   }
 
@@ -121,19 +241,36 @@ export default function App() {
     if (u) { setMe(u); localStorage.setItem('me_id', uid); toast.success(`Ahora eres ${u.name}`); }
   }
 
-  // ------ ONBOARDING VIEW ------
-  if (!ready) return <div className="flex min-h-screen items-center justify-center text-muted-foreground">Cargando...</div>;
+  /* ─── LOADING STATE ─── */
+  if (!ready) {
+    return (
+      <div className="flex min-h-[100dvh] items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <div className="rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-3 text-white animate-pulse">
+            <Wallet size={24} />
+          </div>
+          <span className="text-sm text-muted-foreground">Cargando...</span>
+        </div>
+      </div>
+    );
+  }
 
+  /* ─── AUTH GATE ─── */
   if (authStatus && !authStatus.authenticated) {
     return <AuthGate pinSet={authStatus.pin_set} onAuthed={async () => { setReady(false); await boot(); }} />;
   }
 
+  /* ─── ONBOARDING ─── */
   if (needsOnboard) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 p-4">
+      <div className="flex min-h-[100dvh] items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 px-4 py-8">
         <Card className="w-full max-w-md border-indigo-100 shadow-xl">
           <CardHeader>
-            <div className="mb-2 flex justify-center"><div className="rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-3 text-white"><Sparkles size={28} /></div></div>
+            <div className="mb-2 flex justify-center">
+              <div className="rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-3 text-white">
+                <Sparkles size={28} />
+              </div>
+            </div>
             <CardTitle className="text-center text-2xl">Bienvenidos 💜</CardTitle>
             <CardDescription className="text-center">Configura tu espacio financiero</CardDescription>
           </CardHeader>
@@ -141,22 +278,22 @@ export default function App() {
             <div>
               <Label>¿Cómo van a usarla?</Label>
               <div className="mt-2 grid grid-cols-2 gap-2">
-                <Button variant={mode === 'couple' ? 'default' : 'outline'} onClick={() => setMode('couple')}>👫 Pareja</Button>
-                <Button variant={mode === 'single' ? 'default' : 'outline'} onClick={() => setMode('single')}>🧑 Individual</Button>
+                <Button variant={mode === 'couple' ? 'default' : 'outline'} className="h-12" onClick={() => setMode('couple')}>👫 Pareja</Button>
+                <Button variant={mode === 'single' ? 'default' : 'outline'} className="h-12" onClick={() => setMode('single')}>🧑 Individual</Button>
               </div>
             </div>
             <div>
               <Label>{mode === 'couple' ? 'Nombre 1' : 'Tu nombre'}</Label>
-              <Input value={name1} onChange={e => setName1(e.target.value)} />
+              <Input value={name1} onChange={e => setName1(e.target.value)} className="h-12 mt-1.5" />
             </div>
             {mode === 'couple' && (
               <div>
                 <Label>Nombre 2</Label>
-                <Input value={name2} onChange={e => setName2(e.target.value)} />
+                <Input value={name2} onChange={e => setName2(e.target.value)} className="h-12 mt-1.5" />
               </div>
             )}
-            <Button className="w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 hover:opacity-90" onClick={completeOnboard}>
-              Empezar <ArrowRight className="ml-2" size={16} />
+            <Button className="h-12 w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 text-base hover:opacity-90" onClick={completeOnboard}>
+              Empezar <ArrowRight className="ml-2" size={18} />
             </Button>
           </CardContent>
         </Card>
@@ -164,154 +301,296 @@ export default function App() {
     );
   }
 
-  // ------ MAIN LAYOUT ------
+  /* ─── MAIN APP LAYOUT ─── */
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-indigo-50">
-      <Header users={users} me={me} switchMe={switchMe} rates={rates} refreshing={refreshing} onRefresh={refreshRates} onLogout={logout} />
-      <main className="container mx-auto max-w-6xl px-4 py-6">
-        <Tabs value={tab} onValueChange={setTab} className="space-y-4">
-          <TabsList className="grid w-full grid-cols-4">
-            <TabsTrigger value="dashboard">📊 Dashboard</TabsTrigger>
-            <TabsTrigger value="new">➕ Nuevo Gasto</TabsTrigger>
-            <TabsTrigger value="history">📜 Historial</TabsTrigger>
-            <TabsTrigger value="config">⚙️ Ajustes</TabsTrigger>
-          </TabsList>
+    <div className="min-h-[100dvh] bg-gradient-to-br from-slate-50 via-white to-indigo-50/30 pb-20 md:pb-6">
+      {/* Header */}
+      <MobileHeader
+        users={users}
+        me={me}
+        switchMe={switchMe}
+        rates={rates}
+        refreshing={refreshing}
+        onRefresh={refreshRates}
+        onLogout={logout}
+      />
 
-          <TabsContent value="dashboard"><DashboardView data={dashboard} me={me} reload={loadAll} /></TabsContent>
-          <TabsContent value="new"><NewExpenseForm me={me} users={users} categories={categories} wallets={wallets} rates={rates} onSaved={loadAll} onSwitchTab={() => setTab('history')} /></TabsContent>
-          <TabsContent value="history"><HistoryView transactions={transactions} onDelete={async (id) => { await api('/transactions/' + id, { method: 'DELETE' }); toast.success('Eliminado'); await loadAll(); }} /></TabsContent>
-          <TabsContent value="config"><ConfigView users={users} setUsers={setUsers} wallets={wallets} categories={categories} budgets={budgets} reload={loadAll} /></TabsContent>
-        </Tabs>
+      {/* Content */}
+      <main className="mx-auto max-w-6xl px-3 sm:px-4 pt-3 sm:pt-4">
+        {/* Desktop tabs (hidden on mobile) */}
+        <div className="hidden md:flex items-center gap-1 mb-4 bg-white/80 backdrop-blur rounded-xl border p-1">
+          {NAV_ITEMS.map(item => {
+            const Icon = item.icon;
+            const active = tab === item.key;
+            return (
+              <button
+                key={item.key}
+                onClick={() => setTab(item.key)}
+                className={`flex-1 flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition-all ${
+                  active
+                    ? 'bg-gradient-to-r from-indigo-500 to-fuchsia-500 text-white shadow-md'
+                    : 'text-slate-600 hover:bg-slate-100'
+                }`}
+              >
+                <Icon size={16} />
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Tab Content */}
+        <div className="animate-in fade-in duration-200">
+          {tab === 'dashboard' && <DashboardView data={dashboard} me={me} reload={loadAll} />}
+          {tab === 'new' && (
+            <NewExpenseForm
+              me={me}
+              users={users}
+              categories={categories}
+              wallets={wallets}
+              rates={rates}
+              onSaved={loadAll}
+              onSwitchTab={() => setTab('history')}
+            />
+          )}
+          {tab === 'history' && (
+            <HistoryView
+              transactions={transactions}
+              onDelete={async (id) => {
+                await api('/transactions/' + id, { method: 'DELETE' });
+                toast.success('Eliminado');
+                await loadAll();
+              }}
+            />
+          )}
+          {tab === 'config' && (
+            <ConfigView users={users} setUsers={setUsers} wallets={wallets} categories={categories} budgets={budgets} reload={loadAll} />
+          )}
+        </div>
       </main>
+
+      {/* Mobile Bottom Nav */}
+      <nav className="fixed bottom-0 inset-x-0 z-50 md:hidden bg-white/95 backdrop-blur-lg border-t border-slate-200 safe-bottom">
+        <div className="flex items-stretch" style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
+          {NAV_ITEMS.map(item => {
+            const Icon = item.icon;
+            const active = tab === item.key;
+            return (
+              <button
+                key={item.key}
+                onClick={() => setTab(item.key)}
+                className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-2 transition-colors ${
+                  active ? 'text-indigo-600' : 'text-slate-400'
+                }`}
+              >
+                <div className={`p-1.5 rounded-xl transition-all ${active ? 'bg-indigo-50' : ''}`}>
+                  <Icon size={20} strokeWidth={active ? 2.5 : 1.5} />
+                </div>
+                <span className={`text-[10px] font-medium ${active ? 'text-indigo-600' : 'text-slate-500'}`}>
+                  {item.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </nav>
     </div>
   );
 }
 
-// ------ HEADER ------
-function Header({ users, me, switchMe, rates, refreshing, onRefresh, onLogout }) {
+/* ══════════════════════════════════════════════
+   MOBILE HEADER
+   ══════════════════════════════════════════════ */
+function MobileHeader({ users, me, switchMe, rates, refreshing, onRefresh, onLogout }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
   return (
-    <header className="border-b bg-white/70 backdrop-blur-sm sticky top-0 z-40">
-      <div className="container mx-auto max-w-6xl flex items-center justify-between px-4 py-3">
-        <div className="flex items-center gap-3">
-          <div className="rounded-xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-2 text-white"><Wallet size={20} /></div>
-          <div>
-            <div className="text-sm font-semibold leading-tight">Finanzas Pareja</div>
-            <div className="text-[11px] text-muted-foreground">Multi-moneda + USDT</div>
+    <header className="border-b bg-white/80 backdrop-blur-md sticky top-0 z-40">
+      <div className="mx-auto max-w-6xl flex items-center justify-between px-3 sm:px-4 h-14">
+        {/* Logo */}
+        <div className="flex items-center gap-2.5">
+          <div className="rounded-xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-1.5 text-white">
+            <Wallet size={18} />
+          </div>
+          <div className="hidden sm:block">
+            <div className="text-sm font-bold leading-tight">Finanzas Pareja</div>
+            <div className="text-[10px] text-muted-foreground">Multi-moneda + USDT</div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+
+        {/* Desktop: rates pill + user selector */}
+        <div className="hidden md:flex items-center gap-2">
           <RatesPill rates={rates} refreshing={refreshing} onRefresh={onRefresh} />
           {users.length > 1 && (
             <Select value={me?.id} onValueChange={switchMe}>
-              <SelectTrigger className="w-[140px] h-9"><SelectValue /></SelectTrigger>
+              <SelectTrigger className="w-[130px] h-9"><SelectValue /></SelectTrigger>
               <SelectContent>
                 {users.map(u => <SelectItem key={u.id} value={u.id}>👤 {u.name}</SelectItem>)}
               </SelectContent>
             </Select>
           )}
-          {onLogout && (
-            <Button variant="ghost" size="icon" className="h-9 w-9" title="Cerrar sesión" onClick={onLogout}>
-              <LogOut size={16} />
-            </Button>
+          <Button variant="ghost" size="icon" className="h-9 w-9" title="Cerrar sesión" onClick={onLogout}>
+            <LogOut size={16} />
+          </Button>
+        </div>
+
+        {/* Mobile: compact controls */}
+        <div className="flex md:hidden items-center gap-1.5">
+          {/* Rates badge (compact) */}
+          {rates?.bcv_usd?.rate && (
+            <button
+              onClick={onRefresh}
+              className="flex items-center gap-1 rounded-full bg-slate-900 text-white px-2.5 py-1 text-[10px]"
+            >
+              <span className="opacity-70">BCV</span>
+              <span className="font-bold">{fmtNum(rates.bcv_usd.rate, 0)}</span>
+              <RefreshCw size={10} className={refreshing ? 'animate-spin' : ''} />
+            </button>
           )}
+
+          {/* User/Menu Sheet */}
+          <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
+            <SheetTrigger asChild>
+              <Button variant="ghost" size="icon" className="h-9 w-9">
+                <Menu size={20} />
+              </Button>
+            </SheetTrigger>
+            <SheetContent side="right" className="w-72 p-0">
+              <SheetHeader className="p-4 pb-2 border-b bg-gradient-to-br from-indigo-50 to-fuchsia-50">
+                <SheetTitle className="text-base">Finanzas Pareja 💜</SheetTitle>
+              </SheetHeader>
+              <div className="p-4 space-y-4">
+                {/* Current user */}
+                {me && (
+                  <div className="rounded-lg bg-indigo-50 p-3">
+                    <div className="text-xs text-muted-foreground mb-1">Registrando como:</div>
+                    <div className="font-semibold text-indigo-700">👤 {me.name}</div>
+                  </div>
+                )}
+
+                {/* Switch user */}
+                {users.length > 1 && (
+                  <div>
+                    <Label className="text-xs text-muted-foreground">Cambiar usuario</Label>
+                    <div className="mt-1.5 grid grid-cols-2 gap-2">
+                      {users.map(u => (
+                        <Button
+                          key={u.id}
+                          variant={u.id === me?.id ? 'default' : 'outline'}
+                          size="sm"
+                          className="h-10"
+                          onClick={() => { switchMe(u.id); setMenuOpen(false); }}
+                        >
+                          {u.name}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Rates info */}
+                <div>
+                  <Label className="text-xs text-muted-foreground">Tasas de cambio</Label>
+                  <div className="mt-1.5 space-y-1.5">
+                    <div className="flex items-center justify-between rounded-lg border px-3 py-2">
+                      <span className="text-xs text-muted-foreground">BCV USD/VES</span>
+                      <span className="text-sm font-bold">{rates?.bcv_usd ? fmtNum(rates.bcv_usd.rate) : '—'}</span>
+                    </div>
+                    <div className="flex items-center justify-between rounded-lg border px-3 py-2">
+                      <span className="text-xs text-muted-foreground">Binance USDT</span>
+                      <span className="text-sm font-bold">{rates?.binance_usdt ? fmtNum(rates.binance_usdt.rate) : '—'}</span>
+                    </div>
+                    <div className="flex items-center justify-between rounded-lg border px-3 py-2">
+                      <span className="text-xs text-muted-foreground">BCV EUR/VES</span>
+                      <span className="text-sm font-bold">{rates?.bcv_eur ? fmtNum(rates.bcv_eur.rate) : '—'}</span>
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full mt-2 h-9"
+                    onClick={onRefresh}
+                    disabled={refreshing}
+                  >
+                    <RefreshCw size={14} className={`mr-2 ${refreshing ? 'animate-spin' : ''}`} />
+                    {refreshing ? 'Actualizando...' : 'Actualizar tasas'}
+                  </Button>
+                </div>
+
+                <Separator />
+
+                {/* Logout */}
+                <Button variant="ghost" className="w-full justify-start text-rose-600 hover:text-rose-700 hover:bg-rose-50 h-11" onClick={() => { onLogout(); setMenuOpen(false); }}>
+                  <LogOut size={16} className="mr-2" /> Cerrar sesión
+                </Button>
+              </div>
+            </SheetContent>
+          </Sheet>
         </div>
       </div>
     </header>
   );
 }
 
-// ------ AUTH GATE ------
-function AuthGate({ pinSet, onAuthed }) {
-  const [pin, setPin] = useState('');
-  const [pin2, setPin2] = useState('');
-  const [loading, setLoading] = useState(false);
-
-  async function submit() {
-    if (!pin || pin.trim().length < 4) { toast.error('El PIN debe tener al menos 4 caracteres'); return; }
-    if (!pinSet && pin !== pin2) { toast.error('Los PIN no coinciden'); return; }
-    setLoading(true);
-    try {
-      await api(pinSet ? '/auth/login' : '/auth/setup', { method: 'POST', body: JSON.stringify({ pin }) });
-      toast.success(pinSet ? 'Bienvenido de nuevo 💜' : 'PIN creado con éxito');
-      await onAuthed();
-    } catch (e) { toast.error(e.message); }
-    finally { setLoading(false); }
-  }
-
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 p-4">
-      <Card className="w-full max-w-sm border-indigo-100 shadow-xl">
-        <CardHeader>
-          <div className="mb-2 flex justify-center"><div className="rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 p-3 text-white"><Lock size={26} /></div></div>
-          <CardTitle className="text-center text-xl">{pinSet ? 'Ingresa tu PIN' : 'Crea un PIN de acceso'}</CardTitle>
-          <CardDescription className="text-center">
-            {pinSet ? 'Introduce la clave compartida para entrar' : 'Protege tus finanzas con una clave que ambos compartan'}
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div>
-            <Label>PIN</Label>
-            <Input type="password" inputMode="numeric" autoFocus value={pin}
-              onChange={e => setPin(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && pinSet) submit(); }}
-              placeholder="••••" />
-          </div>
-          {!pinSet && (
-            <div>
-              <Label>Confirma el PIN</Label>
-              <Input type="password" inputMode="numeric" value={pin2}
-                onChange={e => setPin2(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') submit(); }}
-                placeholder="••••" />
-            </div>
-          )}
-          <Button className="w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 hover:opacity-90" onClick={submit} disabled={loading}>
-            {loading ? 'Un momento...' : (pinSet ? 'Entrar' : 'Crear PIN y entrar')}
-          </Button>
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
 function RatesPill({ rates, refreshing, onRefresh }) {
   return (
-    <div className="hidden md:flex items-center gap-2 rounded-full bg-slate-900 text-white px-3 py-1 text-xs">
-      <span className="opacity-70">BCV</span> <span className="font-semibold">{rates?.bcv_usd ? fmtNum(rates.bcv_usd.rate) : '—'}</span>
+    <div className="flex items-center gap-2 rounded-full bg-slate-900 text-white px-3 py-1.5 text-xs">
+      <span className="opacity-70">BCV</span>
+      <span className="font-semibold">{rates?.bcv_usd ? fmtNum(rates.bcv_usd.rate) : '—'}</span>
       <Separator orientation="vertical" className="h-3 bg-white/20" />
-      <span className="opacity-70">USDT</span> <span className="font-semibold">{rates?.binance_usdt ? fmtNum(rates.binance_usdt.rate) : '—'}</span>
-      <button onClick={onRefresh} className="ml-1 opacity-70 hover:opacity-100"><RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} /></button>
+      <span className="opacity-70">USDT</span>
+      <span className="font-semibold">{rates?.binance_usdt ? fmtNum(rates.binance_usdt.rate) : '—'}</span>
+      <button onClick={onRefresh} className="ml-1 opacity-70 hover:opacity-100">
+        <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
+      </button>
     </div>
   );
 }
 
-// ------ DASHBOARD ------
+/* ══════════════════════════════════════════════
+   DASHBOARD
+   ══════════════════════════════════════════════ */
 function DashboardView({ data, me, reload }) {
   const [settleOpen, setSettleOpen] = useState(false);
-  if (!data) return <div className="text-muted-foreground">Cargando...</div>;
+  if (!data) return <div className="py-12 text-center text-muted-foreground">Cargando dashboard...</div>;
   const { net, totals, budgets, rates } = data;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3 sm:space-y-4">
       {/* Net debt hero card */}
       {net && (
         <Card className="overflow-hidden border-0 bg-gradient-to-br from-indigo-600 via-purple-600 to-fuchsia-600 text-white shadow-xl">
-          <CardContent className="p-6">
-            <div className="mb-2 flex items-center gap-2 text-white/80"><Snowflake size={16} /> <span className="text-xs uppercase tracking-wider">Deuda neta actual</span></div>
+          <CardContent className="p-4 sm:p-6">
+            <div className="mb-2 flex items-center gap-2 text-white/80">
+              <Snowflake size={14} />
+              <span className="text-[11px] uppercase tracking-wider">Deuda neta actual</span>
+            </div>
             {Number(net.amount_usd) < 0.01 ? (
-              <div className="flex items-center gap-3"><CheckCircle2 size={28} /><div className="text-2xl font-bold">Están al día · $0.00</div></div>
+              <div className="flex items-center gap-3">
+                <CheckCircle2 size={24} />
+                <div className="text-xl sm:text-2xl font-bold">Están al día · $0.00</div>
+              </div>
             ) : (
               <>
-                <div className="text-3xl md:text-4xl font-bold">
+                <div className="text-lg sm:text-2xl md:text-3xl font-bold leading-tight">
                   {net.from.name} le debe a {net.to.name}
                 </div>
-                <div className="mt-2 flex flex-wrap items-baseline gap-4">
-                  <div><span className="text-4xl font-black">${fmtNum(net.amount_usd)}</span><span className="ml-1 text-white/70">USD</span></div>
-                  <div className="flex items-center gap-1 rounded-full bg-white/15 px-3 py-1 text-sm"><Coins size={14} /> {fmtNum(net.amount_usdt)} USDT · congelado</div>
+                <div className="mt-2 flex flex-wrap items-baseline gap-3">
+                  <div>
+                    <span className="text-3xl sm:text-4xl font-black">${fmtNum(net.amount_usd)}</span>
+                    <span className="ml-1 text-white/70 text-sm">USD</span>
+                  </div>
+                  <div className="flex items-center gap-1 rounded-full bg-white/15 px-2.5 py-1 text-xs sm:text-sm">
+                    <Coins size={12} /> {fmtNum(net.amount_usdt)} USDT
+                  </div>
                 </div>
-                <div className="mt-4">
-                  <Button variant="secondary" className="bg-white text-indigo-700 hover:bg-white/90" onClick={() => setSettleOpen(true)}>
-                    <HandCoins size={16} className="mr-2" /> Liquidar deuda · borrón y cuenta nueva
+                <div className="mt-3">
+                  <Button
+                    variant="secondary"
+                    className="bg-white text-indigo-700 hover:bg-white/90 h-10 text-sm"
+                    onClick={() => setSettleOpen(true)}
+                  >
+                    <HandCoins size={15} className="mr-1.5" /> Liquidar deuda
                   </Button>
                 </div>
               </>
@@ -321,47 +600,66 @@ function DashboardView({ data, me, reload }) {
         </Card>
       )}
 
-      {/* Totals grid */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <StatCard icon={<Users size={16} />} label="#Nos este mes" value={`$${fmtNum(totals?.total_nos)}`} color="indigo" />
-        <StatCard icon={<DollarSign size={16} />} label="#Mio este mes" value={`$${fmtNum(totals?.total_mio)}`} color="slate" />
-        <StatCard icon={<Snowflake size={16} />} label="Préstamos USDT" value={`${fmtNum(totals?.total_prestamo_usdt)} ₮`} color="fuchsia" />
-        <StatCard icon={<Receipt size={16} />} label="Transacciones" value={totals?.n || 0} color="emerald" />
+      {/* Stats grid */}
+      <div className="grid grid-cols-2 gap-2 sm:gap-3 sm:grid-cols-4">
+        <StatCard icon={<Users size={14} />} label="#Nos" value={`$${fmtNum(totals?.total_nos)}`} color="indigo" />
+        <StatCard icon={<DollarSign size={14} />} label="#Mio" value={`$${fmtNum(totals?.total_mio)}`} color="slate" />
+        <StatCard icon={<Snowflake size={14} />} label="USDT" value={`${fmtNum(totals?.total_prestamo_usdt)} ₮`} color="fuchsia" />
+        <StatCard icon={<Receipt size={14} />} label="Transacciones" value={totals?.n || 0} color="emerald" />
       </div>
 
       {/* Budgets */}
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2"><PiggyBank size={18} /> Presupuestos del mes</CardTitle>
-          <CardDescription>Verde &lt;75% · Amarillo 75-90% · Rojo &gt;90%</CardDescription>
+        <CardHeader className="pb-2 px-4 sm:px-6">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <PiggyBank size={16} /> Presupuestos
+          </CardTitle>
         </CardHeader>
-        <CardContent className="space-y-3">
-          {budgets?.length === 0 && <div className="text-sm text-muted-foreground">Aún no hay presupuestos. Crea uno en Ajustes.</div>}
-          {budgets?.map(b => {
-            const pct = b.pct || 0;
-            const color = pct > 90 ? 'bg-rose-500' : pct > 75 ? 'bg-amber-500' : 'bg-emerald-500';
-            return (
-              <div key={b.id}>
-                <div className="mb-1 flex items-center justify-between text-sm">
-                  <span className="font-medium">{b.category_icon} {b.category_name} {!b.is_shared && '(personal)'}</span>
-                  <span className="tabular-nums text-muted-foreground">${fmtNum(b.spent_usd)} / ${fmtNum(b.monthly_limit_usd)} · <span className={pct > 90 ? 'text-rose-600 font-semibold' : pct > 75 ? 'text-amber-600 font-semibold' : ''}>{pct.toFixed(0)}%</span></span>
+        <CardContent className="px-4 sm:px-6 pb-4">
+          {budgets?.length === 0 && (
+            <div className="text-sm text-muted-foreground py-4 text-center">Aún no hay presupuestos. Crea uno en Ajustes.</div>
+          )}
+          <div className="space-y-3">
+            {budgets?.map(b => {
+              const pct = b.pct || 0;
+              const color = pct > 90 ? 'bg-rose-500' : pct > 75 ? 'bg-amber-500' : 'bg-emerald-500';
+              return (
+                <div key={b.id}>
+                  <div className="mb-1 flex items-center justify-between text-xs sm:text-sm">
+                    <span className="font-medium truncate mr-2">
+                      {b.category_icon} {b.category_name}
+                      {!b.is_shared && <span className="text-muted-foreground"> (personal)</span>}
+                    </span>
+                    <span className="tabular-nums text-muted-foreground whitespace-nowrap">
+                      ${fmtNum(b.spent_usd)} / ${fmtNum(b.monthly_limit_usd)}
+                      <span className={`ml-1 ${pct > 90 ? 'text-rose-600 font-semibold' : pct > 75 ? 'text-amber-600 font-semibold' : ''}`}>
+                        {pct.toFixed(0)}%
+                      </span>
+                    </span>
+                  </div>
+                  <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
+                    <div className={`h-full ${color} transition-all`} style={{ width: `${Math.min(100, pct)}%` }} />
+                  </div>
                 </div>
-                <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden">
-                  <div className={`h-full ${color} transition-all`} style={{ width: `${Math.min(100, pct)}%` }} />
-                </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </CardContent>
       </Card>
 
       {/* Rates card */}
       <Card>
-        <CardHeader><CardTitle className="flex items-center gap-2"><TrendingUp size={18} /> Tasas de cambio</CardTitle></CardHeader>
-        <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <RateCard label="BCV · USD/VES" rate={rates?.bcv_usd?.rate} at={rates?.bcv_usd?.fetched_at} />
-          <RateCard label="BCV · EUR/VES" rate={rates?.bcv_eur?.rate} at={rates?.bcv_eur?.fetched_at} />
-          <RateCard label="Binance P2P · USDT/VES" rate={rates?.binance_usdt?.rate} at={rates?.binance_usdt?.fetched_at} highlight />
+        <CardHeader className="pb-2 px-4 sm:px-6">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <TrendingUp size={16} /> Tasas de cambio
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="px-4 sm:px-6 pb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-3">
+            <RateCard label="BCV · USD/VES" rate={rates?.bcv_usd?.rate} at={rates?.bcv_usd?.fetched_at} />
+            <RateCard label="BCV · EUR/VES" rate={rates?.bcv_eur?.rate} at={rates?.bcv_eur?.fetched_at} />
+            <RateCard label="Binance P2P" rate={rates?.binance_usdt?.rate} at={rates?.binance_usdt?.fetched_at} highlight />
+          </div>
         </CardContent>
       </Card>
     </div>
@@ -369,12 +667,19 @@ function DashboardView({ data, me, reload }) {
 }
 
 function StatCard({ icon, label, value, color }) {
-  const colors = { indigo: 'bg-indigo-50 text-indigo-700', slate: 'bg-slate-50 text-slate-700', fuchsia: 'bg-fuchsia-50 text-fuchsia-700', emerald: 'bg-emerald-50 text-emerald-700' };
+  const colors = {
+    indigo: 'bg-indigo-50 text-indigo-600',
+    slate: 'bg-slate-50 text-slate-600',
+    fuchsia: 'bg-fuchsia-50 text-fuchsia-600',
+    emerald: 'bg-emerald-50 text-emerald-600',
+  };
   return (
-    <Card className="border-slate-200">
-      <CardContent className="p-4">
-        <div className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ${colors[color]}`}>{icon}{label}</div>
-        <div className="mt-2 text-2xl font-bold">{value}</div>
+    <Card className="border-slate-200/60">
+      <CardContent className="p-3 sm:p-4">
+        <div className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] sm:text-[11px] font-medium ${colors[color]}`}>
+          {icon}{label}
+        </div>
+        <div className="mt-1.5 text-lg sm:text-2xl font-bold tabular-nums">{value}</div>
       </CardContent>
     </Card>
   );
@@ -382,15 +687,17 @@ function StatCard({ icon, label, value, color }) {
 
 function RateCard({ label, rate, at, highlight }) {
   return (
-    <div className={`rounded-lg border p-4 ${highlight ? 'border-fuchsia-200 bg-fuchsia-50/50' : 'border-slate-200'}`}>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="mt-1 text-2xl font-bold tabular-nums">{rate ? fmtNum(rate, 4) : '—'}</div>
-      {at && <div className="mt-1 text-[10px] text-muted-foreground">{new Date(at).toLocaleString('es-VE')}</div>}
+    <div className={`rounded-lg border p-3 ${highlight ? 'border-fuchsia-200 bg-fuchsia-50/50' : 'border-slate-200'}`}>
+      <div className="text-[10px] sm:text-xs text-muted-foreground">{label}</div>
+      <div className="mt-0.5 text-lg sm:text-2xl font-bold tabular-nums">{rate ? fmtNum(rate, 4) : '—'}</div>
+      {at && <div className="mt-0.5 text-[9px] sm:text-[10px] text-muted-foreground">{new Date(at).toLocaleString('es-VE')}</div>}
     </div>
   );
 }
 
-// ------ NEW EXPENSE FORM ------
+/* ══════════════════════════════════════════════
+   NEW EXPENSE FORM
+   ══════════════════════════════════════════════ */
 function NewExpenseForm({ me, users, categories, wallets, rates, onSaved, onSwitchTab }) {
   const [type, setType] = useState('NOS');
   const [amount, setAmount] = useState('');
@@ -450,12 +757,15 @@ function NewExpenseForm({ me, users, categories, wallets, rates, onSaved, onSwit
     if (type === 'PRESTAMO' && !beneficiary) { toast.error('Selecciona beneficiario'); return; }
     setSaving(true);
     try {
-      await api('/transactions', { method: 'POST', body: JSON.stringify({
-        payer_id: me.id, type, original_amount: amount, original_currency: currency,
-        applied_rate: rateOverride || undefined,
-        beneficiary_id: type === 'PRESTAMO' ? beneficiary : null,
-        category_id: categoryId || null, wallet_id: walletId || null, description,
-      })});
+      await api('/transactions', {
+        method: 'POST',
+        body: JSON.stringify({
+          payer_id: me.id, type, original_amount: amount, original_currency: currency,
+          applied_rate: rateOverride || undefined,
+          beneficiary_id: type === 'PRESTAMO' ? beneficiary : null,
+          category_id: categoryId || null, wallet_id: walletId || null, description,
+        }),
+      });
       toast.success('✅ Gasto registrado');
       setAmount(''); setDescription(''); setRateOverride('');
       await onSaved();
@@ -466,31 +776,50 @@ function NewExpenseForm({ me, users, categories, wallets, rates, onSaved, onSwit
 
   return (
     <Card>
-      <CardHeader><CardTitle>Registrar gasto</CardTitle><CardDescription>El sistema calcula automáticamente USD y USDT</CardDescription></CardHeader>
-      <CardContent className="space-y-4">
+      <CardHeader className="px-4 sm:px-6 pb-2">
+        <CardTitle className="text-base sm:text-lg">Registrar gasto</CardTitle>
+        <CardDescription className="text-xs sm:text-sm">El sistema calcula automáticamente USD y USDT</CardDescription>
+      </CardHeader>
+      <CardContent className="px-4 sm:px-6 pb-4 space-y-4">
+        {/* Type selector */}
         <div>
-          <Label>Tipo</Label>
-          <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-2">
+          <Label className="text-sm">Tipo</Label>
+          <div className="mt-2 grid grid-cols-3 gap-1.5 sm:gap-2">
             {TX_TYPES.map(t => (
-              <button key={t.code} onClick={() => setType(t.code)}
-                className={`rounded-lg border p-3 text-left transition ${type === t.code ? 'border-indigo-500 ring-2 ring-indigo-500/20 bg-indigo-50/40' : 'border-slate-200 hover:border-slate-300'}`}>
-                <div className={`inline-block h-2 w-2 rounded-full ${t.color} mr-2`}></div>
-                <span className="font-medium text-sm">{t.label}</span>
-                <div className="text-[11px] text-muted-foreground mt-1">{t.desc}</div>
+              <button
+                key={t.code}
+                onClick={() => setType(t.code)}
+                className={`rounded-xl border p-2.5 sm:p-3 text-center transition-all ${
+                  type === t.code
+                    ? 'border-indigo-500 ring-2 ring-indigo-500/20 bg-indigo-50/50'
+                    : 'border-slate-200 hover:border-slate-300 active:bg-slate-50'
+                }`}
+              >
+                <div className="text-lg sm:text-xl">{t.icon}</div>
+                <div className="font-semibold text-[11px] sm:text-xs mt-0.5">{t.label}</div>
+                <div className="text-[9px] sm:text-[10px] text-muted-foreground mt-0.5 hidden sm:block">{t.desc}</div>
               </button>
             ))}
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-3">
+        {/* Amount + Currency */}
+        <div className="grid grid-cols-3 gap-2 sm:gap-3">
           <div className="col-span-2">
-            <Label>Monto</Label>
-            <Input type="number" step="0.01" placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} className="text-lg" />
+            <Label className="text-sm">Monto</Label>
+            <Input
+              type="number"
+              step="0.01"
+              placeholder="0.00"
+              value={amount}
+              onChange={e => setAmount(e.target.value)}
+              className="h-12 text-lg mt-1.5"
+            />
           </div>
           <div>
-            <Label>Moneda</Label>
+            <Label className="text-sm">Moneda</Label>
             <Select value={currency} onValueChange={setCurrency}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectTrigger className="h-12 mt-1.5"><SelectValue /></SelectTrigger>
               <SelectContent>
                 {CURRENCIES.map(c => <SelectItem key={c} value={c}>{currencySymbol(c)} {c}</SelectItem>)}
               </SelectContent>
@@ -498,30 +827,39 @@ function NewExpenseForm({ me, users, categories, wallets, rates, onSaved, onSwit
           </div>
         </div>
 
+        {/* Rate override */}
         {(currency === 'BS' || currency === 'EUR') && (
-          <div className="rounded-md bg-slate-50 p-3">
-            <Label className="text-xs">Tasa {currency}/USD</Label>
-            <div className="mt-1 flex items-center gap-2">
-              <div className="text-sm text-muted-foreground">Sugerida BCV: <b className="text-slate-900">{fmtNum(suggestedRate, 4)}</b></div>
-              <Input type="number" step="0.0001" placeholder="Sobrescribir..." value={rateOverride} onChange={e => setRateOverride(e.target.value)} className="max-w-[160px] h-8" />
+          <div className="rounded-lg bg-slate-50 p-3">
+            <div className="text-xs text-muted-foreground">Tasa {currency}/USD</div>
+            <div className="mt-1 flex flex-col sm:flex-row items-start sm:items-center gap-2">
+              <div className="text-sm text-muted-foreground">BCV: <b className="text-slate-900">{fmtNum(suggestedRate, 4)}</b></div>
+              <Input
+                type="number"
+                step="0.0001"
+                placeholder="Sobrescribir..."
+                value={rateOverride}
+                onChange={e => setRateOverride(e.target.value)}
+                className="max-w-full sm:max-w-[160px] h-9"
+              />
             </div>
           </div>
         )}
 
-        <div className="grid grid-cols-2 gap-3">
+        {/* Category + Wallet */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>
-            <Label>Categoría <span className="text-xs text-muted-foreground">· auto IA ✨</span></Label>
+            <Label className="text-sm">Categoría <span className="text-[10px] text-muted-foreground">· auto IA ✨</span></Label>
             <Select value={categoryId} onValueChange={setCategoryId}>
-              <SelectTrigger><SelectValue placeholder="Auto (IA)" /></SelectTrigger>
+              <SelectTrigger className="h-11 mt-1.5"><SelectValue placeholder="Auto (IA)" /></SelectTrigger>
               <SelectContent>
                 {categories.map(c => <SelectItem key={c.id} value={c.id}>{c.icon} {c.name}</SelectItem>)}
               </SelectContent>
             </Select>
           </div>
           <div>
-            <Label>Billetera (opcional)</Label>
+            <Label className="text-sm">Billetera <span className="text-[10px] text-muted-foreground">· opcional</span></Label>
             <Select value={walletId} onValueChange={setWalletId}>
-              <SelectTrigger><SelectValue placeholder="Ninguna" /></SelectTrigger>
+              <SelectTrigger className="h-11 mt-1.5"><SelectValue placeholder="Ninguna" /></SelectTrigger>
               <SelectContent>
                 {myWallets.map(w => <SelectItem key={w.id} value={w.id}>{w.name} ({w.currency})</SelectItem>)}
               </SelectContent>
@@ -529,11 +867,12 @@ function NewExpenseForm({ me, users, categories, wallets, rates, onSaved, onSwit
           </div>
         </div>
 
+        {/* Beneficiary (for PRESTAMO) */}
         {type === 'PRESTAMO' && (
           <div>
-            <Label>Beneficiario del préstamo</Label>
+            <Label className="text-sm">Beneficiario del préstamo</Label>
             <Select value={beneficiary} onValueChange={setBeneficiary}>
-              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectTrigger className="h-11 mt-1.5"><SelectValue /></SelectTrigger>
               <SelectContent>
                 {users.filter(u => u.id !== me?.id).map(u => <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>)}
               </SelectContent>
@@ -541,62 +880,107 @@ function NewExpenseForm({ me, users, categories, wallets, rates, onSaved, onSwit
           </div>
         )}
 
+        {/* Description */}
         <div>
-          <Label>Descripción</Label>
-          <Textarea placeholder="Ej: cena en La Estancia" value={description} onChange={e => setDescription(e.target.value)} rows={2} />
+          <Label className="text-sm">Descripción</Label>
+          <Textarea
+            placeholder="Ej: cena en La Estancia"
+            value={description}
+            onChange={e => setDescription(e.target.value)}
+            rows={2}
+            className="mt-1.5"
+          />
         </div>
 
         {/* Preview */}
-        <div className="rounded-xl border-2 border-dashed border-indigo-200 bg-gradient-to-br from-indigo-50 to-fuchsia-50 p-4">
-          <div className="text-xs text-muted-foreground mb-2">Previsualización</div>
-          <div className="flex flex-wrap items-baseline gap-4">
-            <div><span className="text-2xl font-bold">${fmtNum(amountUsd)}</span> <span className="text-xs text-muted-foreground">USD equivalente</span></div>
+        <div className="rounded-xl border-2 border-dashed border-indigo-200 bg-gradient-to-br from-indigo-50/50 to-fuchsia-50/50 p-3 sm:p-4">
+          <div className="text-[10px] sm:text-xs text-muted-foreground mb-1">Previsualización</div>
+          <div className="flex flex-wrap items-baseline gap-3">
+            <div>
+              <span className="text-xl sm:text-2xl font-bold">${fmtNum(amountUsd)}</span>
+              <span className="text-[10px] sm:text-xs text-muted-foreground ml-1">USD</span>
+            </div>
             {type === 'PRESTAMO' && (
-              <div className="flex items-center gap-1 rounded-full bg-fuchsia-500 text-white px-3 py-1 text-sm font-semibold">
-                <Snowflake size={12} /> {fmtNum(amountUsdt)} USDT · congelado
+              <div className="flex items-center gap-1 rounded-full bg-fuchsia-500 text-white px-2.5 py-0.5 text-xs font-semibold">
+                <Snowflake size={11} /> {fmtNum(amountUsdt)} USDT
               </div>
             )}
           </div>
-          {type === 'NOS' && parseFloat(amount) > 0 && <div className="mt-1 text-xs text-muted-foreground">Cada uno aporta ${fmtNum(amountUsd / 2)}</div>}
+          {type === 'NOS' && parseFloat(amount) > 0 && (
+            <div className="mt-1 text-[10px] sm:text-xs text-muted-foreground">
+              Cada uno aporta ${fmtNum(amountUsd / 2)}
+            </div>
+          )}
         </div>
 
-        <Button className="w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500" disabled={saving} onClick={submit}>
-          {saving ? 'Guardando...' : '💾 Registrar gasto'}
+        <Button
+          className="h-12 w-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 text-base font-semibold"
+          disabled={saving}
+          onClick={submit}
+        >
+          {saving ? (
+            <><RefreshCw size={16} className="mr-2 animate-spin" /> Guardando...</>
+          ) : (
+            '💾 Registrar gasto'
+          )}
         </Button>
       </CardContent>
     </Card>
   );
 }
 
-// ------ HISTORY ------
+/* ══════════════════════════════════════════════
+   HISTORY
+   ══════════════════════════════════════════════ */
 function HistoryView({ transactions, onDelete }) {
-  const typeColor = { NOS: 'bg-indigo-100 text-indigo-800', MIO: 'bg-slate-100 text-slate-800', PRESTAMO: 'bg-fuchsia-100 text-fuchsia-800' };
+  const typeColor = {
+    NOS: 'bg-indigo-100 text-indigo-800',
+    MIO: 'bg-slate-100 text-slate-800',
+    PRESTAMO: 'bg-fuchsia-100 text-fuchsia-800',
+  };
+
   return (
     <Card>
-      <CardHeader><CardTitle>Historial de transacciones</CardTitle><CardDescription>Últimas 50 operaciones</CardDescription></CardHeader>
-      <CardContent>
-        {transactions.length === 0 && <div className="text-sm text-muted-foreground py-8 text-center">No hay transacciones aún</div>}
+      <CardHeader className="px-4 sm:px-6 pb-2">
+        <CardTitle className="text-base sm:text-lg">Historial</CardTitle>
+        <CardDescription className="text-xs sm:text-sm">Últimas 50 operaciones</CardDescription>
+      </CardHeader>
+      <CardContent className="px-4 sm:px-6 pb-4">
+        {transactions.length === 0 && (
+          <div className="text-sm text-muted-foreground py-12 text-center">
+            <Receipt size={32} className="mx-auto mb-2 opacity-30" />
+            No hay transacciones aún
+          </div>
+        )}
         <div className="divide-y">
           {transactions.map(t => (
-            <div key={t.id} className="flex items-center justify-between py-3 gap-3">
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="text-2xl">{t.category_icon || '💰'}</div>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <Badge className={typeColor[t.type]}>#{t.type.toLowerCase()}</Badge>
-                    <span className="font-semibold">{t.description || t.category_name || 'Sin descripción'}</span>
-                  </div>
-                  <div className="text-xs text-muted-foreground mt-0.5">
-                    Pagó <b>{t.payer_name}</b>{t.beneficiary_name ? ` para ${t.beneficiary_name}` : ''} · {new Date(t.transaction_date).toLocaleDateString('es-VE')}
+            <div key={t.id} className="py-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                  <div className="text-xl sm:text-2xl mt-0.5 shrink-0">{t.category_icon || '💰'}</div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <Badge className={`${typeColor[t.type]} text-[10px] px-1.5 py-0`}>#{t.type?.toLowerCase()}</Badge>
+                      <span className="font-semibold text-sm truncate">{t.description || t.category_name || 'Sin descripción'}</span>
+                    </div>
+                    <div className="text-[10px] sm:text-xs text-muted-foreground mt-0.5">
+                      <b>{t.payer_name}</b>{t.beneficiary_name ? ` → ${t.beneficiary_name}` : ''} · {new Date(t.transaction_date).toLocaleDateString('es-VE')}
+                    </div>
                   </div>
                 </div>
-              </div>
-              <div className="flex items-center gap-3 shrink-0">
-                <div className="text-right">
-                  <div className="font-bold tabular-nums">{currencySymbol(t.original_currency)} {fmtNum(t.original_amount)}</div>
-                  <div className="text-xs text-muted-foreground tabular-nums">${fmtNum(t.amount_usd)} USD{t.amount_usdt ? ` · ${fmtNum(t.amount_usdt)} ₮` : ''}</div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <div className="text-right">
+                    <div className="font-bold text-sm tabular-nums">
+                      {currencySymbol(t.original_currency)} {fmtNum(t.original_amount)}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground tabular-nums">
+                      ${fmtNum(t.amount_usd)}{t.amount_usdt ? ` · ${fmtNum(t.amount_usdt)}₮` : ''}
+                    </div>
+                  </div>
+                  <Button size="icon" variant="ghost" className="h-8 w-8 shrink-0" onClick={() => onDelete(t.id)}>
+                    <Trash2 size={13} />
+                  </Button>
                 </div>
-                <Button size="icon" variant="ghost" onClick={() => onDelete(t.id)}><Trash2 size={14} /></Button>
               </div>
             </div>
           ))}
@@ -606,12 +990,14 @@ function HistoryView({ transactions, onDelete }) {
   );
 }
 
-// ------ CONFIG ------
+/* ══════════════════════════════════════════════
+   CONFIG
+   ══════════════════════════════════════════════ */
 function ConfigView({ users, wallets, categories, budgets, reload }) {
   return (
-    <div className="space-y-4">
+    <div className="space-y-3 sm:space-y-4">
       <TelegramSection users={users} reload={reload} />
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="grid gap-3 sm:gap-4 grid-cols-1 md:grid-cols-2">
         <WalletsSection users={users} wallets={wallets} reload={reload} />
         <BudgetsSection categories={categories} users={users} budgets={budgets} reload={reload} />
       </div>
@@ -627,52 +1013,74 @@ function TelegramSection({ users, reload }) {
   const bound = users.filter(u => u.telegram_chat_id);
   const setupWebhook = async () => {
     setBusy(true);
-    try { await api('/telegram/setup', { method: 'POST' }); toast.success('Webhook activado'); const s = await api('/telegram/status'); setStatus(s); }
-    catch (e) { toast.error(e.message); } finally { setBusy(false); }
+    try {
+      await api('/telegram/setup', { method: 'POST' });
+      toast.success('Webhook activado');
+      const s = await api('/telegram/status');
+      setStatus(s);
+    } catch (e) { toast.error(e.message); }
+    finally { setBusy(false); }
   };
-  const unbind = async (uid) => { await api('/telegram/unbind', { method: 'POST', body: JSON.stringify({ user_id: uid }) }); toast.success('Desvinculado'); await reload(); };
+  const unbind = async (uid) => {
+    await api('/telegram/unbind', { method: 'POST', body: JSON.stringify({ user_id: uid }) });
+    toast.success('Desvinculado');
+    await reload();
+  };
+
   return (
     <Card>
-      <CardHeader className="flex flex-row items-start justify-between">
-        <div>
-          <CardTitle className="flex items-center gap-2"><Send size={18} /> Bot de Telegram</CardTitle>
-          <CardDescription>Registra gastos por chat, voz o captura de Pago Móvil (OCR)</CardDescription>
-        </div>
-        <div className="flex items-center gap-2">
-          {status?.info?.url ? <Badge className="bg-emerald-100 text-emerald-800">Webhook activo</Badge> : <Badge variant="outline">Sin webhook</Badge>}
-          <Button size="sm" variant="outline" onClick={setupWebhook} disabled={busy}>{busy ? 'Configurando...' : 'Activar/Reconectar'}</Button>
+      <CardHeader className="px-4 sm:px-6">
+        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+          <div>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Send size={16} /> Bot de Telegram
+            </CardTitle>
+            <CardDescription className="text-xs sm:text-sm mt-1">
+              Registra gastos por chat, voz o foto
+            </CardDescription>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {status?.info?.url
+              ? <Badge className="bg-emerald-100 text-emerald-800 text-[10px]">Webhook activo</Badge>
+              : <Badge variant="outline" className="text-[10px]">Sin webhook</Badge>
+            }
+            <Button size="sm" variant="outline" onClick={setupWebhook} disabled={busy} className="h-8 text-xs">
+              {busy ? 'Configurando...' : 'Activar'}
+            </Button>
+          </div>
         </div>
       </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4">
-          <div className="text-sm font-semibold mb-1">📲 Cómo vincularse</div>
-          <ol className="list-decimal list-inside text-sm space-y-1 text-slate-700">
-            <li>Abrir el bot: <a href={botLink} target="_blank" rel="noreferrer" className="text-indigo-600 underline font-medium">@Finanzas_ParejaJM_Bot</a></li>
-            <li>Enviar el comando <code className="bg-white px-1.5 py-0.5 rounded text-xs">/start</code></li>
-            <li>Tocar tu nombre en los botones</li>
-            <li>Empezar a enviar gastos 🎉</li>
+      <CardContent className="px-4 sm:px-6 pb-4 space-y-3">
+        {/* How to link */}
+        <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-3">
+          <div className="text-xs font-semibold mb-1">📲 Cómo vincularse</div>
+          <ol className="list-decimal list-inside text-xs space-y-0.5 text-slate-700">
+            <li>Abrir: <a href={botLink} target="_blank" rel="noreferrer" className="text-indigo-600 underline font-medium">@Finanzas_ParejaJM_Bot</a></li>
+            <li>Enviar <code className="bg-white px-1 py-0.5 rounded text-[10px]">/start</code></li>
+            <li>Tocar tu nombre</li>
           </ol>
         </div>
 
-        <div className="rounded-lg border p-3 text-sm">
-          <div className="font-medium mb-2">✍️ Sintaxis rápida</div>
-          <div className="space-y-1 text-slate-600 text-xs font-mono">
-            <div><b>30$ cena #Nos J</b> · 30 USD compartido con J</div>
-            <div><b>5000 bs comida #Mio</b> · 5000 Bs personal</div>
-            <div><b>15 usd hotel #Prestamo J</b> · 15 USD prestado a J (congela USDT)</div>
-            <div><b>🎤 Nota de voz</b> en español · transcripción automática</div>
-            <div><b>📷 Foto de Pago Móvil</b> · OCR automático</div>
+        {/* Syntax */}
+        <div className="rounded-lg border p-3 text-xs">
+          <div className="font-medium mb-1.5">✍️ Sintaxis rápida</div>
+          <div className="space-y-0.5 text-slate-600 text-[11px] font-mono">
+            <div><b>30$ cena #Nos J</b></div>
+            <div><b>5000 bs comida #Mio</b></div>
+            <div><b>15 usd hotel #Prestamo J</b></div>
+            <div>🎤 Nota de voz · 📷 Foto OCR</div>
           </div>
         </div>
 
+        {/* Bindings */}
         <div>
-          <div className="text-sm font-medium mb-2">Vinculaciones actuales</div>
-          {bound.length === 0 && <div className="text-xs text-muted-foreground">Nadie vinculado aún. Envía /start al bot.</div>}
+          <div className="text-xs font-medium mb-1.5">Vinculaciones</div>
+          {bound.length === 0 && <div className="text-[11px] text-muted-foreground">Nadie vinculado. Envía /start al bot.</div>}
           <div className="space-y-1">
             {bound.map(u => (
-              <div key={u.id} className="flex items-center justify-between rounded border px-3 py-2 text-sm">
-                <span>✅ <b>{u.name}</b> · chat #{u.telegram_chat_id}</span>
-                <Button size="sm" variant="ghost" onClick={() => unbind(u.id)}>Desvincular</Button>
+              <div key={u.id} className="flex items-center justify-between rounded border px-3 py-2 text-xs">
+                <span>✅ <b>{u.name}</b></span>
+                <Button size="sm" variant="ghost" className="h-7 text-[11px]" onClick={() => unbind(u.id)}>Desvincular</Button>
               </div>
             ))}
           </div>
@@ -689,10 +1097,13 @@ function SettleDialog({ open, setOpen, net, onDone }) {
   const submit = async () => {
     setSaving(true);
     try {
-      await api('/settlements', { method: 'POST', body: JSON.stringify({
-        payer_id: net.from.id, receiver_id: net.to.id, amount_usd: net.amount_usd, notes,
-      })});
-      toast.success('✨ Deuda liquidada · borrón y cuenta nueva');
+      await api('/settlements', {
+        method: 'POST',
+        body: JSON.stringify({
+          payer_id: net.from.id, receiver_id: net.to.id, amount_usd: net.amount_usd, notes,
+        }),
+      });
+      toast.success('✨ Deuda liquidada');
       setOpen(false); setNotes('');
       await onDone();
     } catch (e) { toast.error(e.message); }
@@ -700,7 +1111,7 @@ function SettleDialog({ open, setOpen, net, onDone }) {
   };
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent>
+      <DialogContent className="max-w-[calc(100vw-2rem)] sm:max-w-md rounded-xl">
         <DialogHeader><DialogTitle>Liquidar deuda</DialogTitle></DialogHeader>
         <div className="space-y-3">
           <div className="rounded-lg bg-gradient-to-br from-indigo-50 to-fuchsia-50 border p-4 text-center">
@@ -710,14 +1121,13 @@ function SettleDialog({ open, setOpen, net, onDone }) {
           </div>
           <div>
             <Label>Notas (opcional)</Label>
-            <Textarea placeholder="Ej: Transferencia Binance · TxID XXX" value={notes} onChange={e => setNotes(e.target.value)} rows={2} />
+            <Textarea placeholder="Ej: Transferencia Binance" value={notes} onChange={e => setNotes(e.target.value)} rows={2} className="mt-1.5" />
           </div>
-          <p className="text-xs text-muted-foreground">Se marcarán como conciliadas todas las transacciones #Nos y #Prestamo pendientes entre {net.from.name} y {net.to.name}.</p>
         </div>
-        <DialogFooter>
+        <DialogFooter className="flex-col sm:flex-row gap-2">
           <Button variant="ghost" onClick={() => setOpen(false)}>Cancelar</Button>
           <Button className="bg-gradient-to-r from-indigo-500 to-fuchsia-500" disabled={saving} onClick={submit}>
-            {saving ? 'Liquidando...' : '💸 Confirmar liquidación'}
+            {saving ? 'Liquidando...' : '💸 Confirmar'}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -729,60 +1139,88 @@ function WalletsSection({ users, wallets, reload }) {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ user_id: '', name: '', currency: 'USD', account_type: 'BANK', current_balance: 0 });
   async function submit() {
-    try { await api('/wallets', { method: 'POST', body: JSON.stringify(form) }); toast.success('Billetera creada'); setOpen(false); setForm({ user_id: '', name: '', currency: 'USD', account_type: 'BANK', current_balance: 0 }); await reload(); }
-    catch (e) { toast.error(e.message); }
+    try {
+      await api('/wallets', { method: 'POST', body: JSON.stringify(form) });
+      toast.success('Billetera creada');
+      setOpen(false);
+      setForm({ user_id: '', name: '', currency: 'USD', account_type: 'BANK', current_balance: 0 });
+      await reload();
+    } catch (e) { toast.error(e.message); }
   }
-  async function del(id) { await api('/wallets/' + id, { method: 'DELETE' }); toast.success('Eliminada'); await reload(); }
+  async function del(id) {
+    await api('/wallets/' + id, { method: 'DELETE' });
+    toast.success('Eliminada');
+    await reload();
+  }
   return (
     <Card>
-      <CardHeader className="flex flex-row items-center justify-between">
-        <div><CardTitle className="flex items-center gap-2"><Wallet size={18} /> Billeteras</CardTitle><CardDescription>Bancos, Pago Móvil, Efectivo</CardDescription></div>
+      <CardHeader className="px-4 sm:px-6 flex flex-row items-center justify-between">
+        <div>
+          <CardTitle className="flex items-center gap-2 text-base"><Wallet size={16} /> Billeteras</CardTitle>
+          <CardDescription className="text-xs">Bancos y cuentas</CardDescription>
+        </div>
         <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild><Button size="sm"><Plus size={14} className="mr-1" /> Nueva</Button></DialogTrigger>
-          <DialogContent>
+          <DialogTrigger asChild>
+            <Button size="sm" className="h-8"><Plus size={14} className="mr-1" /> Nueva</Button>
+          </DialogTrigger>
+          <DialogContent className="max-w-[calc(100vw-2rem)] sm:max-w-md rounded-xl">
             <DialogHeader><DialogTitle>Nueva billetera</DialogTitle></DialogHeader>
             <div className="space-y-3">
-              <div><Label>Dueño</Label>
+              <div>
+                <Label className="text-sm">Dueño</Label>
                 <Select value={form.user_id} onValueChange={v => setForm({ ...form, user_id: v })}>
-                  <SelectTrigger><SelectValue placeholder="Selecciona..." /></SelectTrigger>
+                  <SelectTrigger className="h-11 mt-1"><SelectValue placeholder="Selecciona..." /></SelectTrigger>
                   <SelectContent>{users.map(u => <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>)}</SelectContent>
-                </Select></div>
-              <div><Label>Nombre</Label><Input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="Ej: Banesco, Pago Móvil BDV, Efectivo" /></div>
+                </Select>
+              </div>
+              <div>
+                <Label className="text-sm">Nombre</Label>
+                <Input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="Ej: Banesco" className="h-11 mt-1" />
+              </div>
               <div className="grid grid-cols-2 gap-2">
-                <div><Label>Tipo</Label>
+                <div>
+                  <Label className="text-sm">Tipo</Label>
                   <Select value={form.account_type} onValueChange={v => setForm({ ...form, account_type: v })}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="BANK">Banco</SelectItem>
                       <SelectItem value="PAYMENT_GATEWAY">Pago Móvil</SelectItem>
                       <SelectItem value="CASH">Efectivo</SelectItem>
-                      <SelectItem value="CREDIT">Crédito (Cashea)</SelectItem>
+                      <SelectItem value="CREDIT">Crédito</SelectItem>
                     </SelectContent>
-                  </Select></div>
-                <div><Label>Moneda</Label>
+                  </Select>
+                </div>
+                <div>
+                  <Label className="text-sm">Moneda</Label>
                   <Select value={form.currency} onValueChange={v => setForm({ ...form, currency: v })}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
                     <SelectContent>{CURRENCIES.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
-                  </Select></div>
+                  </Select>
+                </div>
               </div>
-              <div><Label>Saldo inicial</Label><Input type="number" step="0.01" value={form.current_balance} onChange={e => setForm({ ...form, current_balance: e.target.value })} /></div>
+              <div>
+                <Label className="text-sm">Saldo inicial</Label>
+                <Input type="number" step="0.01" value={form.current_balance} onChange={e => setForm({ ...form, current_balance: e.target.value })} className="h-11 mt-1" />
+              </div>
             </div>
-            <DialogFooter><Button onClick={submit}>Crear</Button></DialogFooter>
+            <DialogFooter className="flex-col sm:flex-row gap-2">
+              <Button onClick={submit} className="h-11">Crear</Button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       </CardHeader>
-      <CardContent>
-        {wallets.length === 0 && <div className="text-sm text-muted-foreground text-center py-4">Aún no hay billeteras</div>}
+      <CardContent className="px-4 sm:px-6 pb-4">
+        {wallets.length === 0 && <div className="text-xs text-muted-foreground text-center py-4">Aún no hay billeteras</div>}
         <div className="divide-y">
           {wallets.map(w => (
-            <div key={w.id} className="flex items-center justify-between py-2">
-              <div>
-                <div className="font-medium text-sm">{w.name} <Badge variant="secondary" className="ml-1">{w.currency}</Badge></div>
-                <div className="text-xs text-muted-foreground">{w.user_name || users.find(u => u.id === w.user_id)?.name} · {w.account_type}</div>
+            <div key={w.id} className="flex items-center justify-between py-2.5">
+              <div className="min-w-0">
+                <div className="font-medium text-sm truncate">{w.name} <Badge variant="secondary" className="ml-1 text-[10px]">{w.currency}</Badge></div>
+                <div className="text-[10px] sm:text-xs text-muted-foreground">{w.user_name || users.find(u => u.id === w.user_id)?.name} · {w.account_type}</div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 shrink-0">
                 <div className="text-sm font-semibold tabular-nums">{fmtNum(w.current_balance)}</div>
-                <Button size="icon" variant="ghost" onClick={() => del(w.id)}><Trash2 size={14} /></Button>
+                <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => del(w.id)}><Trash2 size={13} /></Button>
               </div>
             </div>
           ))}
@@ -796,57 +1234,81 @@ function BudgetsSection({ categories, users, budgets, reload }) {
   const [open, setOpen] = useState(false);
   const [form, setForm] = useState({ category_id: '', monthly_limit_usd: '', is_shared: true, user_id: '' });
   async function submit() {
-    try { await api('/budgets', { method: 'POST', body: JSON.stringify(form) }); toast.success('Presupuesto guardado'); setOpen(false); await reload(); }
-    catch (e) { toast.error(e.message); }
+    try {
+      await api('/budgets', { method: 'POST', body: JSON.stringify(form) });
+      toast.success('Presupuesto guardado');
+      setOpen(false);
+      await reload();
+    } catch (e) { toast.error(e.message); }
   }
-  async function del(id) { await api('/budgets/' + id, { method: 'DELETE' }); toast.success('Eliminado'); await reload(); }
+  async function del(id) {
+    await api('/budgets/' + id, { method: 'DELETE' });
+    toast.success('Eliminado');
+    await reload();
+  }
   return (
     <Card>
-      <CardHeader className="flex flex-row items-center justify-between">
-        <div><CardTitle className="flex items-center gap-2"><PiggyBank size={18} /> Presupuestos</CardTitle><CardDescription>Límites mensuales por categoría</CardDescription></div>
+      <CardHeader className="px-4 sm:px-6 flex flex-row items-center justify-between">
+        <div>
+          <CardTitle className="flex items-center gap-2 text-base"><PiggyBank size={16} /> Presupuestos</CardTitle>
+          <CardDescription className="text-xs">Límites mensuales</CardDescription>
+        </div>
         <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild><Button size="sm"><Plus size={14} className="mr-1" /> Nuevo</Button></DialogTrigger>
-          <DialogContent>
+          <DialogTrigger asChild>
+            <Button size="sm" className="h-8"><Plus size={14} className="mr-1" /> Nuevo</Button>
+          </DialogTrigger>
+          <DialogContent className="max-w-[calc(100vw-2rem)] sm:max-w-md rounded-xl">
             <DialogHeader><DialogTitle>Nuevo presupuesto</DialogTitle></DialogHeader>
             <div className="space-y-3">
-              <div><Label>Categoría</Label>
+              <div>
+                <Label className="text-sm">Categoría</Label>
                 <Select value={form.category_id} onValueChange={v => setForm({ ...form, category_id: v })}>
-                  <SelectTrigger><SelectValue placeholder="Selecciona..." /></SelectTrigger>
+                  <SelectTrigger className="h-11 mt-1"><SelectValue placeholder="Selecciona..." /></SelectTrigger>
                   <SelectContent>{categories.map(c => <SelectItem key={c.id} value={c.id}>{c.icon} {c.name}</SelectItem>)}</SelectContent>
-                </Select></div>
-              <div><Label>Límite mensual (USD)</Label><Input type="number" step="0.01" value={form.monthly_limit_usd} onChange={e => setForm({ ...form, monthly_limit_usd: e.target.value })} placeholder="300" /></div>
-              <div><Label>Alcance</Label>
+                </Select>
+              </div>
+              <div>
+                <Label className="text-sm">Límite mensual (USD)</Label>
+                <Input type="number" step="0.01" value={form.monthly_limit_usd} onChange={e => setForm({ ...form, monthly_limit_usd: e.target.value })} placeholder="300" className="h-11 mt-1" />
+              </div>
+              <div>
+                <Label className="text-sm">Alcance</Label>
                 <Select value={form.is_shared ? 'shared' : 'personal'} onValueChange={v => setForm({ ...form, is_shared: v === 'shared', user_id: v === 'shared' ? '' : form.user_id })}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectTrigger className="h-11 mt-1"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="shared">Compartido (#Nos)</SelectItem>
                     <SelectItem value="personal">Personal (#Mio)</SelectItem>
                   </SelectContent>
-                </Select></div>
+                </Select>
+              </div>
               {!form.is_shared && (
-                <div><Label>Usuario</Label>
+                <div>
+                  <Label className="text-sm">Usuario</Label>
                   <Select value={form.user_id} onValueChange={v => setForm({ ...form, user_id: v })}>
-                    <SelectTrigger><SelectValue placeholder="Selecciona..." /></SelectTrigger>
+                    <SelectTrigger className="h-11 mt-1"><SelectValue placeholder="Selecciona..." /></SelectTrigger>
                     <SelectContent>{users.map(u => <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>)}</SelectContent>
-                  </Select></div>
+                  </Select>
+                </div>
               )}
             </div>
-            <DialogFooter><Button onClick={submit}>Guardar</Button></DialogFooter>
+            <DialogFooter className="flex-col sm:flex-row gap-2">
+              <Button onClick={submit} className="h-11">Guardar</Button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       </CardHeader>
-      <CardContent>
-        {budgets.length === 0 && <div className="text-sm text-muted-foreground text-center py-4">Aún no hay presupuestos</div>}
+      <CardContent className="px-4 sm:px-6 pb-4">
+        {budgets.length === 0 && <div className="text-xs text-muted-foreground text-center py-4">Aún no hay presupuestos</div>}
         <div className="divide-y">
           {budgets.map(b => (
-            <div key={b.id} className="flex items-center justify-between py-2">
-              <div>
-                <div className="font-medium text-sm">{b.category_icon} {b.category_name} {!b.is_shared && `· ${b.user_name}`}</div>
-                <div className="text-xs text-muted-foreground">{b.is_shared ? 'Compartido' : 'Personal'}</div>
+            <div key={b.id} className="flex items-center justify-between py-2.5">
+              <div className="min-w-0">
+                <div className="font-medium text-sm truncate">{b.category_icon} {b.category_name}{!b.is_shared && ` · ${b.user_name}`}</div>
+                <div className="text-[10px] sm:text-xs text-muted-foreground">{b.is_shared ? 'Compartido' : 'Personal'}</div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 shrink-0">
                 <div className="text-sm font-semibold tabular-nums">${fmtNum(b.monthly_limit_usd)}</div>
-                <Button size="icon" variant="ghost" onClick={() => del(b.id)}><Trash2 size={14} /></Button>
+                <Button size="icon" variant="ghost" className="h-8 w-8" onClick={() => del(b.id)}><Trash2 size={13} /></Button>
               </div>
             </div>
           ))}
