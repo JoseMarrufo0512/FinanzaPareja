@@ -5,7 +5,7 @@ import { refreshRates, getLatestRates } from '@/lib/rates';
 import { D, fmt } from '@/lib/money';
 import { parseExpenseText } from '@/lib/parser';
 import { tg, sendMessage, answerCallback, downloadFile, setWebhook, getWebhookInfo } from '@/lib/telegram';
-import { transcribeAudio, extractReceipt } from '@/lib/ai';
+import { transcribeAudio, extractReceipt, suggestCategory } from '@/lib/ai';
 import { startScheduler } from '@/lib/scheduler';
 
 Decimal.set({ precision: 30, rounding: Decimal.ROUND_HALF_UP });
@@ -43,10 +43,15 @@ async function handleParsedExpense(me, parsed, chatId, source = 'WHATSAPP_BOT') 
   });
   const usdtLine = tx.amount_usdt ? `\n❄️ <b>Congelado:</b> ${Number(tx.amount_usdt).toFixed(2)} USDT` : '';
   const benef = beneficiary_id ? users.find(u => u.id === beneficiary_id)?.name : null;
+  let catLine = '';
+  if (tx.category_id) {
+    const c = (await query('SELECT name, icon FROM categories WHERE id=$1', [tx.category_id])).rows[0];
+    if (c) catLine = `\n🏷️ <b>${c.icon || ''} ${c.name}</b>${tx._category_auto ? ' <i>(IA)</i>' : ''}`;
+  }
   const typeIcon = { NOS: '👫', MIO: '🧑', PRESTAMO: '🤝' }[parsed.type];
   await sendMessage(chatId,
     `${typeIcon} <b>Registrado #${parsed.type}</b>\n` +
-    `${parsed.currency} <b>${parsed.amount.toFixed(2)}</b> · ~$${Number(tx.amount_usd).toFixed(2)} USD${usdtLine}\n` +
+    `${parsed.currency} <b>${parsed.amount.toFixed(2)}</b> · ~$${Number(tx.amount_usd).toFixed(2)} USD${usdtLine}${catLine}\n` +
     (benef ? `Para: <b>${benef}</b>\n` : '') +
     (parsed.description ? `<i>${parsed.description}</i>` : ''));
   notifyPartner(tx).catch(() => {});
@@ -80,14 +85,29 @@ async function createTransaction(b) {
     else if (currency === 'USDT') amountUsdt = originalAmount.toDecimalPlaces(2);
     if (amountUsdt === null) amountUsdt = (binUsdt.gt(0) && ves) ? ves.div(binUsdt).toDecimalPlaces(2) : amountUsd;
   }
+  // AI auto-categorization: when no category is chosen but we have a description
+  let categoryId = b.category_id || null;
+  let categoryAuto = false;
+  if (!categoryId && b.description && b.auto_categorize !== false) {
+    try {
+      const cats = (await query('SELECT id, name FROM categories')).rows;
+      const suggested = await suggestCategory(b.description, cats.map(c => c.name));
+      if (suggested) {
+        const match = cats.find(c => c.name.toLowerCase() === suggested.toLowerCase());
+        if (match) { categoryId = match.id; categoryAuto = true; }
+      }
+    } catch (e) { console.error('auto-categorize', e.message); }
+  }
   const r = await query(
     `INSERT INTO transactions(payer_id, wallet_id, type, original_amount, original_currency, applied_rate, amount_usd, amount_usdt, usdt_rate, beneficiary_id, category_id, description, receipt_image_url, created_via, transaction_date)
      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, COALESCE($15::timestamptz, NOW())) RETURNING *`,
     [b.payer_id, b.wallet_id || null, b.type, originalAmount.toFixed(2), currency, appliedRate.toFixed(6), amountUsd.toFixed(2),
-     amountUsdt ? amountUsdt.toString() : null, usdtRate, b.beneficiary_id || null, b.category_id || null, b.description || null,
+     amountUsdt ? amountUsdt.toString() : null, usdtRate, b.beneficiary_id || null, categoryId, b.description || null,
      b.receipt_image_url || null, b.created_via || 'WEB', b.transaction_date || null]
   );
-  return r.rows[0];
+  const created = r.rows[0];
+  created._category_auto = categoryAuto;
+  return created;
 }
 
 async function notifyPartner(tx) {

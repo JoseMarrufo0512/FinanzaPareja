@@ -436,9 +436,9 @@ function NewExpenseForm({ me, users, categories, wallets, rates, onSaved, onSwit
 
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label>Categoría</Label>
+            <Label>Categoría <span className="text-xs text-muted-foreground">· auto IA ✨</span></Label>
             <Select value={categoryId} onValueChange={setCategoryId}>
-              <SelectTrigger><SelectValue placeholder="Seleccionar..." /></SelectTrigger>
+              <SelectTrigger><SelectValue placeholder="Auto (IA)" /></SelectTrigger>
               <SelectContent>
                 {categories.map(c => <SelectItem key={c.id} value={c.id}>{c.icon} {c.name}</SelectItem>)}
               </SelectContent>
