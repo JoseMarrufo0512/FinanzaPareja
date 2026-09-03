@@ -1,0 +1,18 @@
+import './globals.css';
+import { Toaster } from '@/components/ui/sonner';
+
+export const metadata = {
+  title: 'Finanzas Pareja — Gastos Compartidos',
+  description: 'Gastos compartidos con congelamiento USDT y tasas BCV/Binance en tiempo real',
+};
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="es" suppressHydrationWarning>
+      <body className="min-h-screen bg-background text-foreground antialiased">
+        {children}
+        <Toaster position="top-right" richColors />
+      </body>
+    </html>
+  );
+}
