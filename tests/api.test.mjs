@@ -300,6 +300,55 @@ async function main() {
     check('reenviar el mismo botón no duplica gastos', after === txs.length, `${txs.length} → ${after}`);
   }
 
+  // ── CONCILIACIÓN BANCARIA ───────────────────────────────────────────
+  console.log('\nCONCILIACIÓN BANCARIA');
+  {
+    // Registramos un gasto que sí debe aparecer en el "extracto".
+    const known = await api('/transactions', { method: 'POST', body: JSON.stringify({
+      payer_id: jose.id, type: 'MIO', original_amount: '4321.50', original_currency: 'BS',
+      wallet_id: walletId, description: 'Farmacia SAAS', auto_categorize: false,
+    })});
+    const hoy = new Date().toLocaleDateString('es-VE');
+    const extracto = [
+      'FECHA        DESCRIPCION                 MONTO',
+      `${hoy}  COMPRA POS FARMACIA SAAS   -4.321,50`,
+      `${hoy}  PAGO MOVIL REF 998877       -2.500,00`,
+      'linea sin datos utiles',
+    ].join('\n');
+
+    const r = await api('/reconciliation/analyze', { method: 'POST', body: JSON.stringify({ text: extracto, wallet_id: walletId }) });
+    check('analiza el extracto pegado', r.status === 200, JSON.stringify(r.body).slice(0, 150));
+    check('reconoce el gasto ya registrado', r.body.matched.some(m => m.transaction.id === known.body.id),
+      JSON.stringify(r.body.matched.map(m => m.line.amount)));
+    check('señala el movimiento que falta', r.body.missing.some(l => near(l.amount, 2500)),
+      JSON.stringify(r.body.missing.map(l => l.amount)));
+    check('ignora las líneas sin datos', r.body.unparsed >= 1, `unparsed=${r.body.unparsed}`);
+
+    const missing = r.body.missing.find(l => near(l.amount, 2500));
+    const created = await api('/reconciliation/create', { method: 'POST', body: JSON.stringify({ line: missing, wallet_id: walletId }) });
+    check('crea el gasto faltante desde el extracto', created.status === 201 && near(created.body.original_amount, 2500), JSON.stringify(created.body).slice(0, 120));
+    check('y ese gasto descuenta la billetera', !!created.body.wallet_amount);
+
+    const r2 = await api('/reconciliation/analyze', { method: 'POST', body: JSON.stringify({ text: extracto, wallet_id: walletId }) });
+    check('tras registrarlo, ya no aparece como faltante', !r2.body.missing.some(l => near(l.amount, 2500)),
+      JSON.stringify(r2.body.missing.map(l => l.amount)));
+  }
+
+  // ── INFORME MENSUAL ─────────────────────────────────────────────────
+  console.log('\nINFORME MENSUAL');
+  {
+    const month = new Date().toISOString().slice(0, 7);
+    const r = await api(`/reports/monthly?month=${month}`);
+    check('genera el informe del mes', r.status === 200 && r.body.month === month);
+    check('trae desglose por categoría', Array.isArray(r.body.by_category) && r.body.by_category.length > 0);
+    check('los porcentajes suman ~100', Math.abs(r.body.by_category.reduce((a, c) => a + c.pct, 0) - 100) < 1.5,
+      String(r.body.by_category.reduce((a, c) => a + c.pct, 0)));
+    check('trae el congelado en USDT', r.body.frozen_usdt !== undefined);
+    check('trae el desglose por persona', Array.isArray(r.body.by_member) && r.body.by_member.length >= 2);
+    const bad = await api('/reports/monthly?month=abc');
+    check('rechaza un mes inválido', bad.status === 422);
+  }
+
   // ── VALIDACIONES (regresión de seguridad) ───────────────────────────
   console.log('\nVALIDACIONES');
   {
@@ -311,6 +360,58 @@ async function main() {
     check('tipo inválido → 422', typ.status === 422);
     const nm = await api('/users', { method: 'POST', body: JSON.stringify({}) });
     check('usuario sin nombre → 422', nm.status === 422);
+  }
+
+  // ── CAMBIO DE PIN (va al final: cierra sesiones) ────────────────────
+  console.log('\nCAMBIO DE PIN');
+  {
+    const wrong = await api('/auth/change-pin', { method: 'POST', body: JSON.stringify({ current_pin: '0000', new_pin: '5678' }) });
+    check('rechaza el PIN actual equivocado', wrong.status === 401, `status=${wrong.status}`);
+
+    const short = await api('/auth/change-pin', { method: 'POST', body: JSON.stringify({ current_pin: PIN, new_pin: '12' }) });
+    check('rechaza un PIN nuevo demasiado corto', short.status === 422);
+
+    const ok = await api('/auth/change-pin', { method: 'POST', body: JSON.stringify({ current_pin: PIN, new_pin: '5678' }) });
+    check('cambia el PIN desde Ajustes', ok.status === 200, JSON.stringify(ok.body));
+
+    cookie = '';
+    const oldPin = await api('/auth/login', { method: 'POST', body: JSON.stringify({ pin: PIN }) });
+    check('el PIN viejo ya no sirve', oldPin.status === 401, `status=${oldPin.status}`);
+
+    const newPin = await api('/auth/login', { method: 'POST', body: JSON.stringify({ pin: '5678' }) });
+    check('el PIN nuevo funciona', newPin.status === 200);
+
+    // Lo dejamos como estaba para que la suite sea repetible.
+    await api('/auth/change-pin', { method: 'POST', body: JSON.stringify({ current_pin: '5678', new_pin: PIN }) });
+    cookie = '';
+    const back = await api('/auth/login', { method: 'POST', body: JSON.stringify({ pin: PIN }) });
+    check('se puede restaurar el PIN original', back.status === 200);
+
+    const st = await api('/auth/status');
+    check('auth/status informa el método de sesión', st.body.method === 'PIN', JSON.stringify(st.body));
+    check('auth/status informa si Google está disponible', typeof st.body.google_enabled === 'boolean');
+  }
+
+  // ── FUERZA BRUTA CONTRA EL PIN ──────────────────────────────────────
+  console.log('\nPROTECCIÓN CONTRA FUERZA BRUTA');
+  {
+    const dbUrl = process.env.DEV_DATABASE_URL || 'postgres://dev@127.0.0.1:55432/nf_dev';
+    const psql = (sql) => execSync(`psql "${dbUrl}" -tAqc ${JSON.stringify(sql)}`, { encoding: 'utf8' }).trim();
+    psql('DELETE FROM auth_attempts');
+
+    let blocked = null;
+    for (let i = 0; i < 12; i++) {
+      const r = await api('/auth/login', { method: 'POST', body: JSON.stringify({ pin: '0000' }) });
+      if (r.status === 429) { blocked = i + 1; break; }
+    }
+    check('bloquea tras varios PIN incorrectos', blocked !== null && blocked <= 10, `intentos=${blocked}`);
+
+    const good = await api('/auth/login', { method: 'POST', body: JSON.stringify({ pin: PIN }) });
+    check('el bloqueo también frena el PIN correcto', good.status === 429, `status=${good.status}`);
+
+    psql('DELETE FROM auth_attempts');
+    const after = await api('/auth/login', { method: 'POST', body: JSON.stringify({ pin: PIN }) });
+    check('al expirar la ventana se puede entrar de nuevo', after.status === 200, `status=${after.status}`);
   }
 
   console.log(`\n${'─'.repeat(50)}\n${passed} pasaron · ${failed} fallaron`);

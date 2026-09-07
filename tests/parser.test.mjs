@@ -99,6 +99,36 @@ console.log('\n▶ Reparto de gastos\n');
   check('sin deudas no hay transferencias', settleUp({ a: '0', b: '0' }).length === 0);
 }
 
+console.log('\n▶ Estados de cuenta bancarios\n');
+{
+  const { parseStatement, parseAmount } = load('lib/statement.js', ['parseStatement', 'parseAmount']);
+
+  check('1.234,56 → 1234.56', parseAmount('1.234,56').amount === 1234.56);
+  check('1,234.56 → 1234.56', parseAmount('1,234.56').amount === 1234.56);
+  check('-2.500,00 se lee como negativo', parseAmount('-2.500,00').negative === true);
+
+  const banesco = parseStatement([
+    'FECHA        DESCRIPCION                 MONTO       SALDO',
+    '06/09/2026   COMPRA POS FARMACIA        -4.321,50   395.678,50',
+    '05/09/2026   PAGO MOVIL REF 998877      -2.500,00   398.178,50',
+  ].join('\n'));
+  check('lee 2 movimientos del extracto', banesco.lines.length === 2, JSON.stringify(banesco.lines.map(l => l.amount)));
+  check('no confunde la referencia con el monto', banesco.lines[1].amount === 2500, String(banesco.lines[1].amount));
+  check('toma el movimiento y no el saldo', banesco.lines[0].amount === 4321.5, String(banesco.lines[0].amount));
+  check('extrae la fecha', banesco.lines[0].date === '2026-09-06', String(banesco.lines[0].date));
+  check('extrae la referencia', banesco.lines[1].reference === '998877', String(banesco.lines[1].reference));
+  check('la descripción queda limpia', /FARMACIA/.test(banesco.lines[0].description), banesco.lines[0].description);
+
+  const mixto = parseStatement([
+    '2026-09-01 Netflix 12,99',
+    'basura sin numeros',
+    '03-09-26  TRANSFERENCIA A TERCEROS   1.000,00',
+  ].join('\n'));
+  check('acepta fecha ISO y decimales sin miles', mixto.lines[0].amount === 12.99, String(mixto.lines[0]?.amount));
+  check('acepta fecha con guiones y año corto', mixto.lines[1].date === '2026-09-03', String(mixto.lines[1]?.date));
+  check('cuenta las líneas inservibles', mixto.unparsed === 1, String(mixto.unparsed));
+}
+
 console.log(`\n${'─'.repeat(50)}\n${passed} pasaron · ${failed} fallaron`);
 if (failures.length) failures.forEach(f => console.log('  · ' + f));
 process.exit(failed ? 1 : 0);

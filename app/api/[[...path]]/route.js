@@ -4,11 +4,12 @@ import { initDb, query, withTx } from '@/lib/db';
 import { refreshRates, getLatestRates } from '@/lib/rates';
 import { D, fmt, convertUsdTo } from '@/lib/money';
 import { computeSplits, settleUp } from '@/lib/splits';
+import { parseStatement, matchScore } from '@/lib/statement';
 import { parseExpenseText } from '@/lib/parser';
 import { tg, sendMessage, answerCallback, editMessage, downloadFile, setWebhook, getWebhookInfo } from '@/lib/telegram';
 import { transcribeAudio, extractReceipt, suggestCategory } from '@/lib/ai';
 import { hashPin, verifyPin, newToken, safeEqual } from '@/lib/auth';
-import { startScheduler } from '@/lib/scheduler';
+import { startScheduler, sendDailyReminders } from '@/lib/scheduler';
 
 Decimal.set({ precision: 30, rounding: Decimal.ROUND_HALF_UP });
 
@@ -369,13 +370,66 @@ const SESSION_DAYS = 30;
 async function getSession(req) {
   const token = req.cookies?.get(SESSION_COOKIE)?.value;
   if (!token) return null;
-  const r = await query('SELECT token, expires_at FROM auth_sessions WHERE token=$1', [token]);
+  const r = await query(`
+    SELECT s.token, s.expires_at, s.user_id, s.method, u.name AS user_name, u.email
+    FROM auth_sessions s LEFT JOIN app_users u ON u.id = s.user_id
+    WHERE s.token=$1`, [token]);
   if (!r.rowCount) return null;
   if (new Date(r.rows[0].expires_at) < new Date()) {
     await query('DELETE FROM auth_sessions WHERE token=$1', [token]);
     return null;
   }
   return r.rows[0];
+}
+
+const googleEnabled = () => !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+
+function baseUrl(req) {
+  const configured = process.env.NEXT_PUBLIC_BASE_URL;
+  if (configured) return configured.replace(/\/$/, '');
+  const url = new URL(req.url);
+  return `${url.protocol}//${url.host}`;
+}
+
+// ---- Brute-force protection for the shared PIN ----
+const MAX_ATTEMPTS = 8;          // per IP
+const ATTEMPT_WINDOW = '15 minutes';
+
+function clientIp(req) {
+  const fwd = req.headers.get('x-forwarded-for');
+  if (fwd) return fwd.split(',')[0].trim();
+  return req.headers.get('x-real-ip') || 'unknown';
+}
+
+// Returns the number of seconds the caller must wait, or 0 when allowed.
+async function loginBlockedFor(ip) {
+  const r = await query(
+    `SELECT COUNT(*)::int AS n, MAX(created_at) AS last
+     FROM auth_attempts
+     WHERE ip=$1 AND NOT success AND created_at > NOW() - interval '${ATTEMPT_WINDOW}'`,
+    [ip]
+  );
+  const { n, last } = r.rows[0];
+  if (n < MAX_ATTEMPTS) return 0;
+  const elapsed = (Date.now() - new Date(last).getTime()) / 1000;
+  return Math.max(1, Math.ceil(15 * 60 - elapsed));
+}
+
+async function recordAttempt(ip, success) {
+  await query('INSERT INTO auth_attempts(ip, success) VALUES($1,$2)', [ip, success]);
+  // Opportunistic cleanup so the table stays small.
+  if (Math.random() < 0.05) {
+    await query("DELETE FROM auth_attempts WHERE created_at < NOW() - interval '1 day'").catch(() => {});
+  }
+}
+
+async function createSession(userId = null, method = 'PIN') {
+  const token = newToken();
+  await query(
+    "INSERT INTO auth_sessions(token, expires_at, user_id, method) VALUES($1, NOW() + interval '30 days', $2, $3)",
+    [token, userId, method]
+  );
+  return token;
 }
 
 function setSessionCookie(res, token) {
@@ -402,7 +456,124 @@ async function dispatch(req, params) {
   if (path === '/auth/status' && method === 'GET') {
     const pin_set = await pinIsSet();
     const sess = await getSession(req);
-    return json({ pin_set, authenticated: !!sess });
+    return json({
+      pin_set,
+      authenticated: !!sess,
+      google_enabled: googleEnabled(),
+      method: sess?.method || null,
+      user_id: sess?.user_id || null,
+      user_name: sess?.user_name || null,
+      email: sess?.email || null,
+    });
+  }
+
+  // ---- Google Sign-In (OAuth 2.0 authorization code flow) ----
+  // Only members whose email is registered (or listed in GOOGLE_ALLOWED_EMAILS)
+  // can get in, so the app never becomes open to any Google account.
+  if (path === '/auth/google/start' && method === 'GET') {
+    if (!googleEnabled()) return err('Google no está configurado', 501);
+    const state = newToken().slice(0, 32);
+    const params = new URLSearchParams({
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      redirect_uri: `${baseUrl(req)}/api/auth/google/callback`,
+      response_type: 'code',
+      scope: 'openid email profile',
+      state,
+      prompt: 'select_account',
+      access_type: 'online',
+    });
+    const res = NextResponse.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+    res.cookies.set('g_state', state, { httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 600 });
+    return res;
+  }
+
+  if (path === '/auth/google/callback' && method === 'GET') {
+    if (!googleEnabled()) return err('Google no está configurado', 501);
+    const home = baseUrl(req);
+    const fail = (reason) => NextResponse.redirect(`${home}/?auth_error=${encodeURIComponent(reason)}`);
+
+    const code = url.searchParams.get('code');
+    const state = url.searchParams.get('state');
+    const expected = req.cookies?.get('g_state')?.value;
+    if (!code || !state || !expected || !safeEqual(state, expected)) return fail('Sesión de Google inválida, intenta de nuevo');
+
+    let email = null, name = null;
+    try {
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id: process.env.GOOGLE_CLIENT_ID,
+          client_secret: process.env.GOOGLE_CLIENT_SECRET,
+          redirect_uri: `${home}/api/auth/google/callback`,
+          grant_type: 'authorization_code',
+        }),
+      });
+      const tok = await tokenRes.json();
+      if (!tokenRes.ok || !tok.id_token) throw new Error(tok.error_description || 'token exchange failed');
+      // The id_token comes straight from Google over TLS, so reading its claims
+      // is enough here; we never accept an id_token from the browser.
+      const payload = JSON.parse(Buffer.from(tok.id_token.split('.')[1], 'base64url').toString('utf8'));
+      if (payload.email_verified === false) throw new Error('email no verificado');
+      email = (payload.email || '').toLowerCase();
+      name = payload.name || payload.given_name || null;
+    } catch (e) {
+      console.error('google callback', e.message);
+      return fail('No se pudo verificar la cuenta de Google');
+    }
+    if (!email) return fail('Google no devolvió un correo');
+
+    const allowList = (process.env.GOOGLE_ALLOWED_EMAILS || '')
+      .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const member = (await query('SELECT id, name FROM app_users WHERE LOWER(email)=$1', [email])).rows[0];
+    if (!member && !allowList.includes(email)) {
+      return fail(`La cuenta ${email} no está autorizada. Agrégala al miembro en Ajustes.`);
+    }
+
+    let userId = member?.id || null;
+    // An allow-listed email with no member yet gets attached to a member without email.
+    if (!userId && allowList.includes(email)) {
+      const orphan = (await query('SELECT id FROM app_users WHERE email IS NULL AND is_active ORDER BY created_at LIMIT 1')).rows[0];
+      if (orphan) {
+        await query('UPDATE app_users SET email=$1 WHERE id=$2', [email, orphan.id]);
+        userId = orphan.id;
+      }
+    }
+
+    const token = await createSession(userId, 'GOOGLE');
+    const res = NextResponse.redirect(home + '/');
+    res.cookies.set('g_state', '', { httpOnly: true, path: '/', maxAge: 0 });
+    return setSessionCookie(res, token);
+  }
+
+  // ---- Change PIN (from Ajustes, no database surgery needed) ----
+  if (path === '/auth/change-pin' && method === 'POST') {
+    const sess = await getSession(req);
+    if (!sess) return err('No autorizado', 401);
+    const b = await req.json().catch(() => ({}));
+    const newPin = (b.new_pin || '').toString().trim();
+    if (newPin.length < 4) return err('El nuevo PIN debe tener al menos 4 caracteres', 422);
+    const stored = (await query("SELECT value FROM app_settings WHERE key='access_pin_hash'")).rows[0]?.value;
+    // A PIN already exists: the current one is required, even for Google sessions.
+    if (stored) {
+      const ip = clientIp(req);
+      if (await loginBlockedFor(ip)) return json({ error: 'Demasiados intentos. Espera unos minutos.' }, 429);
+      const currentPin = (b.current_pin || '').toString().trim();
+      if (!verifyPin(currentPin, stored)) {
+        await recordAttempt(ip, false);
+        return err('El PIN actual no es correcto', 401);
+      }
+    }
+    await query(
+      "INSERT INTO app_settings(key,value) VALUES('access_pin_hash',$1) ON CONFLICT(key) DO UPDATE SET value=$1",
+      [hashPin(newPin)]
+    );
+    // Changing the shared PIN invalidates every open session.
+    await query('DELETE FROM auth_sessions');
+    const res = json({ ok: true });
+    res.cookies.set(SESSION_COOKIE, '', { httpOnly: true, path: '/', maxAge: 0 });
+    return res;
   }
   if (path === '/auth/setup' && method === 'POST') {
     if (await pinIsSet()) return err('El PIN ya fue configurado. Usa iniciar sesión.', 409);
@@ -410,18 +581,25 @@ async function dispatch(req, params) {
     const pin = (b.pin || '').toString().trim();
     if (pin.length < 4) return err('El PIN debe tener al menos 4 caracteres', 422);
     await query("INSERT INTO app_settings(key,value) VALUES('access_pin_hash',$1) ON CONFLICT(key) DO UPDATE SET value=$1", [hashPin(pin)]);
-    const token = newToken();
-    await query("INSERT INTO auth_sessions(token, expires_at) VALUES($1, NOW() + interval '30 days')", [token]);
+    const token = await createSession(null, 'PIN');
     return setSessionCookie(json({ ok: true, authenticated: true }, 201), token);
   }
   if (path === '/auth/login' && method === 'POST') {
+    const ip = clientIp(req);
+    const wait = await loginBlockedFor(ip);
+    if (wait) {
+      return json({ error: `Demasiados intentos. Espera ${Math.ceil(wait / 60)} minuto(s).` }, 429);
+    }
     const b = await req.json().catch(() => ({}));
     const pin = (b.pin || '').toString().trim();
     const r = await query("SELECT value FROM app_settings WHERE key='access_pin_hash'");
     if (!r.rowCount || !r.rows[0].value) return err('No hay PIN configurado', 400);
-    if (!verifyPin(pin, r.rows[0].value)) return err('PIN incorrecto', 401);
-    const token = newToken();
-    await query("INSERT INTO auth_sessions(token, expires_at) VALUES($1, NOW() + interval '30 days')", [token]);
+    if (!verifyPin(pin, r.rows[0].value)) {
+      await recordAttempt(ip, false);
+      return err('PIN incorrecto', 401);
+    }
+    await recordAttempt(ip, true);
+    const token = await createSession(null, 'PIN');
     return setSessionCookie(json({ ok: true, authenticated: true }), token);
   }
   if (path === '/auth/logout' && method === 'POST') {
@@ -430,6 +608,18 @@ async function dispatch(req, params) {
     const res = json({ ok: true });
     res.cookies.set(SESSION_COOKIE, '', { httpOnly: true, path: '/', maxAge: 0 });
     return res;
+  }
+
+  // -------- CRON (Vercel scheduler; guarded by a secret, not a session) --------
+  // node-cron cannot survive on serverless, so the 9pm reminder is triggered by
+  // Vercel Cron hitting this endpoint (see vercel.json).
+  if (path === '/cron/daily-reminder') {
+    const secret = process.env.CRON_SECRET;
+    const auth = req.headers.get('authorization') || '';
+    const provided = auth.startsWith('Bearer ') ? auth.slice(7) : url.searchParams.get('key') || '';
+    if (!secret || !safeEqual(provided, secret)) return err('No autorizado', 401);
+    const sent = await sendDailyReminders();
+    return json({ ok: true, sent });
   }
 
   // -------- AUTH GATE (everything except public routes) --------
@@ -835,6 +1025,165 @@ async function dispatch(req, params) {
       FROM settlements s JOIN app_users p ON p.id=s.payer_id JOIN app_users r ON r.id=s.receiver_id
       ORDER BY s.settlement_date DESC LIMIT 100`);
     return json(r.rows);
+  }
+
+  // -------- INFORME MENSUAL --------
+  if (path === '/reports/monthly' && method === 'GET') {
+    const month = url.searchParams.get('month') || new Date().toISOString().slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(month)) return err('Mes inválido', 422);
+    const first = month + '-01';
+
+    const byCategory = (await query(`
+      SELECT COALESCE(c.name, 'Sin categoría') AS category, COALESCE(c.icon,'💰') AS icon,
+             SUM(t.amount_usd)::numeric AS total_usd, COUNT(*)::int AS n
+      FROM transactions t LEFT JOIN categories c ON c.id = t.category_id
+      WHERE t.transaction_date >= $1::date AND t.transaction_date < ($1::date + interval '1 month')
+      GROUP BY 1,2 ORDER BY 3 DESC
+    `, [first])).rows;
+
+    const byType = (await query(`
+      SELECT type, SUM(amount_usd)::numeric AS total_usd,
+             SUM(COALESCE(amount_usdt,0))::numeric AS total_usdt, COUNT(*)::int AS n
+      FROM transactions
+      WHERE transaction_date >= $1::date AND transaction_date < ($1::date + interval '1 month')
+      GROUP BY type
+    `, [first])).rows;
+
+    const byMember = (await query(`
+      SELECT u.id, u.name, u.short, u.color,
+             COALESCE(SUM(s.share_usd) FILTER (WHERE t.type='MIO'), 0)::numeric AS mio_usd,
+             COALESCE(SUM(s.share_usd) FILTER (WHERE t.type='NOS'), 0)::numeric AS nos_share_usd,
+             COALESCE(SUM(s.share_usd), 0)::numeric AS total_usd
+      FROM app_users u
+      LEFT JOIN transaction_splits s ON s.user_id = u.id
+      LEFT JOIN transactions t ON t.id = s.transaction_id
+        AND t.transaction_date >= $1::date AND t.transaction_date < ($1::date + interval '1 month')
+      WHERE t.id IS NOT NULL OR u.is_active
+      GROUP BY u.id, u.name, u.short, u.color ORDER BY u.created_at
+    `, [first])).rows;
+
+    const paidByMember = (await query(`
+      SELECT payer_id, SUM(amount_usd)::numeric AS paid_usd FROM transactions
+      WHERE transaction_date >= $1::date AND transaction_date < ($1::date + interval '1 month')
+      GROUP BY payer_id
+    `, [first])).rows;
+
+    const frozen = (await query(`
+      SELECT COALESCE(SUM(amount_usdt),0)::numeric AS total_usdt,
+             COALESCE(SUM(amount_usd),0)::numeric AS total_usd, COUNT(*)::int AS n
+      FROM transactions WHERE type='PRESTAMO' AND is_reconciled = FALSE
+    `)).rows[0];
+
+    const wallets = (await query('SELECT name, currency, current_balance FROM wallets ORDER BY name')).rows;
+    const settlements = (await query(`
+      SELECT s.amount_usd, s.amount_usdt, s.settlement_date, p.name AS payer_name, r.name AS receiver_name
+      FROM settlements s JOIN app_users p ON p.id=s.payer_id JOIN app_users r ON r.id=s.receiver_id
+      WHERE s.settlement_date >= $1::date AND s.settlement_date < ($1::date + interval '1 month')
+      ORDER BY s.settlement_date DESC
+    `, [first])).rows;
+
+    const total = byCategory.reduce((a, c) => a + Number(c.total_usd), 0);
+    return json({
+      month,
+      generated_at: new Date().toISOString(),
+      total_usd: total.toFixed(2),
+      by_category: byCategory.map(c => ({
+        ...c,
+        pct: total ? Number((Number(c.total_usd) / total * 100).toFixed(1)) : 0,
+      })),
+      by_type: byType,
+      by_member: byMember.map(m => ({
+        ...m,
+        paid_usd: paidByMember.find(p => p.payer_id === m.id)?.paid_usd || '0',
+      })),
+      frozen_usdt: frozen,
+      wallets,
+      settlements,
+      rates: await getLatestRates(),
+    });
+  }
+
+  // -------- CONCILIACIÓN BANCARIA --------
+  // Paste the statement, get back which movements are already recorded and
+  // which ones are missing from the app.
+  if (path === '/reconciliation/analyze' && method === 'POST') {
+    const b = await req.json().catch(() => ({}));
+    if (!b.text || !b.text.toString().trim()) return err('Pega el texto del estado de cuenta', 422);
+    if (b.text.length > 200000) return err('El texto es demasiado largo', 422);
+
+    const { lines, unparsed } = parseStatement(b.text);
+    const wallet = b.wallet_id
+      ? (await query('SELECT id, currency, user_id FROM wallets WHERE id=$1', [b.wallet_id])).rows[0]
+      : null;
+
+    // Candidate expenses: same wallet when given, otherwise anything recent.
+    const txs = (await query(`
+      SELECT id, description, transaction_date, original_amount, original_currency,
+             amount_usd, wallet_amount, wallet_id, is_reconciled
+      FROM transactions
+      WHERE transaction_date > NOW() - interval '120 days'
+      ORDER BY transaction_date DESC
+      LIMIT 500
+    `)).rows;
+
+    const used = new Set();
+    const matched = [], missing = [];
+    for (const line of lines) {
+      let best = null, bestScore = 0;
+      for (const tx of txs) {
+        if (used.has(tx.id)) continue;
+        if (wallet && tx.wallet_id && tx.wallet_id !== wallet.id) continue;
+        // Compare in the statement's currency: the wallet amount when we know
+        // the wallet, otherwise the original amount of the expense.
+        const candidateAmount = wallet
+          ? (tx.wallet_id === wallet.id ? tx.wallet_amount : (tx.original_currency === wallet.currency ? tx.original_amount : null))
+          : tx.original_amount;
+        if (candidateAmount === null || candidateAmount === undefined) continue;
+        const score = matchScore(line, tx, candidateAmount);
+        if (score > bestScore) { bestScore = score; best = tx; }
+      }
+      if (best && bestScore >= 0.7) {
+        used.add(best.id);
+        matched.push({ line, transaction: best, score: Number(bestScore.toFixed(2)) });
+      } else {
+        missing.push(line);
+      }
+    }
+
+    return json({
+      total_lines: lines.length,
+      unparsed,
+      matched,
+      missing,
+      wallet: wallet || null,
+    });
+  }
+
+  // Turn a statement movement the app never saw into a real expense.
+  if (path === '/reconciliation/create' && method === 'POST') {
+    const b = await req.json().catch(() => ({}));
+    const line = b.line || {};
+    const amount = Number(line.amount);
+    if (!isFinite(amount) || amount <= 0) return err('Monto inválido', 422);
+
+    const wallet = b.wallet_id
+      ? (await query('SELECT id, currency, user_id FROM wallets WHERE id=$1', [b.wallet_id])).rows[0]
+      : null;
+    const payerId = b.payer_id || wallet?.user_id
+      || (await query('SELECT id FROM app_users WHERE is_active ORDER BY created_at LIMIT 1')).rows[0]?.id;
+    if (!payerId) return err('No hay miembro al que asignar el gasto', 422);
+
+    const tx = await createTransaction({
+      payer_id: payerId,
+      type: b.type || 'MIO',
+      original_amount: String(amount),
+      original_currency: b.currency || wallet?.currency || 'BS',
+      wallet_id: wallet?.id || null,
+      description: (line.description || line.raw || 'Movimiento bancario').slice(0, 200),
+      transaction_date: line.date || null,
+      created_via: 'RECONCILIATION',
+    });
+    return json(tx, 201);
   }
 
   // -------- TELEGRAM WEBHOOK & SETUP --------

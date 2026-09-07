@@ -2,7 +2,7 @@ import './globals.css';
 import { Toaster } from '@/components/ui/sonner';
 
 export const metadata = {
-  title: 'Finanzas Pareja — Gastos Compartidos',
+  title: 'NuestrasFinanzas — Gastos Compartidos',
   description: 'Gastos compartidos con congelamiento USDT y tasas BCV/Binance en tiempo real',
 };
 
