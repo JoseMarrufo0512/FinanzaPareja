@@ -892,10 +892,13 @@ async function dispatch(req, params) {
 
   // -------- TRANSACTIONS --------
   if (path === '/transactions' && method === 'GET') {
-    const limit = Math.min(500, parseInt(url.searchParams.get('limit') || '100', 10));
+    const parsedLimit = parseInt(url.searchParams.get('limit') || '100', 10);
+    const limit = Math.min(500, Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : 100);
     const type = url.searchParams.get('type');
     const uid = url.searchParams.get('user_id');
     const month = url.searchParams.get('month'); // YYYY-MM
+    if (month && !/^\d{4}-\d{2}$/.test(month)) return err('Mes inválido', 422);
+    if (type && !['NOS', 'MIO', 'PRESTAMO'].includes(type)) return err('Tipo inválido', 422);
     const cond = [];
     const vals = [];
     if (type) { vals.push(type); cond.push(`t.type=$${vals.length}`); }
@@ -1339,6 +1342,7 @@ async function dispatch(req, params) {
 
   if (path === '/dashboard' && method === 'GET') {
     const month = url.searchParams.get('month') || new Date().toISOString().slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(month)) return err('Mes inválido', 422);
     const users = (await query('SELECT id, name, short, color, is_active, telegram_chat_id, email, default_wallet_id FROM app_users ORDER BY created_at')).rows;
     const rates = await getLatestRates();
 
