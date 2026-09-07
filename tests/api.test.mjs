@@ -392,6 +392,33 @@ async function main() {
     check('auth/status informa si Google está disponible', typeof st.body.google_enabled === 'boolean');
   }
 
+  // ── COMPATIBILIDAD CON GASTOS SIN REPARTO ───────────────────────────
+  // Un cliente antiguo (la app de Emergent) escribe gastos sin transaction_splits.
+  console.log('\nGASTOS CREADOS POR UN CLIENTE ANTIGUO');
+  {
+    const dbUrl = process.env.DEV_DATABASE_URL || 'postgres://dev@127.0.0.1:55432/nf_dev';
+    const psql = (sql) => execSync(`psql "${dbUrl}" -tAqc ${JSON.stringify(sql)}`, { encoding: 'utf8' }).trim();
+
+    const tx = await api('/transactions', { method: 'POST', body: JSON.stringify({
+      payer_id: aliexis.id, type: 'NOS', original_amount: '30', original_currency: 'USD',
+      description: 'gasto legado', auto_categorize: false,
+    })});
+    psql(`DELETE FROM transaction_splits WHERE transaction_id='${tx.body.id}'`);
+
+    const d = (await api('/dashboard')).body;
+    const suma = d.per_user.reduce((a, p) => a + Number(p.net_usd), 0);
+    check('las cuentas siguen cuadrando sin filas de reparto', Math.abs(suma) < 0.05, `suma neta=${suma}`);
+    check('el gasto legado igual reparte entre los miembros',
+      d.per_user.filter(p => Number(p.nos_share_usd) > 0).length >= 2,
+      JSON.stringify(d.per_user.map(p => p.nos_share_usd)));
+
+    const fix = await api('/maintenance/rebuild-splits', { method: 'POST' });
+    check('la reparación escribe los repartos que faltaban', fix.body.rebuilt >= 1, JSON.stringify(fix.body));
+    const splits = (await api(`/transactions/${tx.body.id}/splits`)).body;
+    check('el gasto legado queda reparado en la base', splits.length >= 2, `n=${splits.length}`);
+    await api('/transactions/' + tx.body.id, { method: 'DELETE' });
+  }
+
   // ── FUERZA BRUTA CONTRA EL PIN ──────────────────────────────────────
   console.log('\nPROTECCIÓN CONTRA FUERZA BRUTA');
   {

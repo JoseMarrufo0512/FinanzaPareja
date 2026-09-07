@@ -1030,6 +1030,21 @@ async function dispatch(req, params) {
     return json(r.rows);
   }
 
+  // Write split rows for any expense that lacks them (e.g. created by an older
+  // client against the same database).
+  if (path === '/maintenance/rebuild-splits' && method === 'POST') {
+    const rebuilt = await withTx(async (client) => {
+      const orphans = (await client.query(`
+        SELECT t.id, t.type, t.payer_id, t.beneficiary_id, t.amount_usd, t.amount_usdt
+        FROM transactions t
+        WHERE NOT EXISTS (SELECT 1 FROM transaction_splits s WHERE s.transaction_id = t.id)
+      `)).rows;
+      for (const t of orphans) await writeSplits(client, t);
+      return orphans.length;
+    });
+    return json({ ok: true, rebuilt });
+  }
+
   // -------- INFORME MENSUAL --------
   if (path === '/reports/monthly' && method === 'GET') {
     const month = url.searchParams.get('month') || new Date().toISOString().slice(0, 7);
@@ -1358,7 +1373,7 @@ async function dispatch(req, params) {
     }
 
     const openTx = (await query(`
-      SELECT id, type, payer_id, amount_usd, amount_usdt
+      SELECT id, type, payer_id, beneficiary_id, amount_usd, amount_usdt
       FROM transactions WHERE is_reconciled = FALSE
     `)).rows;
     for (const t of openTx) {
@@ -1368,11 +1383,22 @@ async function dispatch(req, params) {
       }
     }
     const openSplits = (await query(`
-      SELECT s.user_id, s.share_usd, s.share_usdt, t.type
+      SELECT s.transaction_id, s.user_id, s.share_usd, s.share_usdt, t.type
       FROM transaction_splits s JOIN transactions t ON t.id = s.transaction_id
       WHERE t.is_reconciled = FALSE
     `)).rows;
-    for (const s of openSplits) {
+    // An expense created by an older client has no split rows; deriving them on
+    // the fly keeps the balances right instead of counting the payment only.
+    const withSplits = new Set(openSplits.map(s => s.transaction_id));
+    const activeIds = users.filter(u => u.is_active).map(u => u.id);
+    const effectiveSplits = [...openSplits];
+    for (const t of openTx) {
+      if (withSplits.has(t.id)) continue;
+      for (const s of computeSplits({ ...t, activeUserIds: activeIds })) {
+        effectiveSplits.push({ ...s, type: t.type });
+      }
+    }
+    for (const s of effectiveSplits) {
       if (!owed[s.user_id]) continue;
       owed[s.user_id] = owed[s.user_id].plus(s.share_usd);
       if (s.type === 'PRESTAMO' && s.share_usdt) frozenOwed[s.user_id] = frozenOwed[s.user_id].plus(s.share_usdt);
