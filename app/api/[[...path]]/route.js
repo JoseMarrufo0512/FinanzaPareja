@@ -5,7 +5,7 @@ import { refreshRates, getLatestRates } from '@/lib/rates';
 import { D, fmt, convertUsdTo } from '@/lib/money';
 import { computeSplits, settleUp } from '@/lib/splits';
 import { parseExpenseText } from '@/lib/parser';
-import { tg, sendMessage, answerCallback, downloadFile, setWebhook, getWebhookInfo } from '@/lib/telegram';
+import { tg, sendMessage, answerCallback, editMessage, downloadFile, setWebhook, getWebhookInfo } from '@/lib/telegram';
 import { transcribeAudio, extractReceipt, suggestCategory } from '@/lib/ai';
 import { hashPin, verifyPin, newToken, safeEqual } from '@/lib/auth';
 import { startScheduler } from '@/lib/scheduler';
@@ -20,22 +20,25 @@ try { startScheduler(); } catch (e) { console.error('scheduler init', e.message)
 
 // Given a parsed expense and the sender's user record, create the transaction and confirm via Telegram.
 async function handleParsedExpense(me, parsed, chatId, source = 'WHATSAPP_BOT') {
-  const users = (await query('SELECT id, name, short FROM app_users')).rows;
+  const users = (await query('SELECT id, name, short FROM app_users WHERE is_active ORDER BY created_at')).rows;
+
+  // "#Mio A" = a personal expense that belongs to Aliexis;
+  // "#Prestamo J" = money lent to José. Both land in beneficiary_id.
   let beneficiary_id = null;
-  if (parsed.type === 'PRESTAMO') {
-    // Prefer explicit hint, else pick the other user in a 2-user setup
-    if (parsed.beneficiaryHint) {
-      const hint = parsed.beneficiaryHint.toLowerCase();
-      const found = users.find(u => u.id !== me.id && (u.short?.toLowerCase() === hint || u.name.toLowerCase().startsWith(hint)));
-      if (found) beneficiary_id = found.id;
-    }
-    if (!beneficiary_id) {
-      const other = users.find(u => u.id !== me.id);
-      if (other) beneficiary_id = other.id;
-      else {
-        await sendMessage(chatId, '❌ No hay otro usuario configurado para el préstamo.');
-        return;
-      }
+  if (parsed.beneficiaryHint) {
+    const hint = parsed.beneficiaryHint.toLowerCase();
+    const norm = (s) => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+    const found = users.find(u => norm(u.short) === norm(hint) || norm(u.name).startsWith(norm(hint)));
+    if (found && found.id !== me.id) beneficiary_id = found.id;
+  }
+  if (parsed.type === 'PRESTAMO' && !beneficiary_id) {
+    const others = users.filter(u => u.id !== me.id);
+    if (others.length === 1) beneficiary_id = others[0].id;
+    else {
+      await sendMessage(chatId, others.length
+        ? `❌ ¿Préstamo para quién? Indica la persona: <code>15$ hotel #Prestamo ${others[0].short || others[0].name}</code>`
+        : '❌ No hay otro miembro configurado para el préstamo.');
+      return;
     }
   }
   const tx = await createTransaction({
@@ -51,12 +54,154 @@ async function handleParsedExpense(me, parsed, chatId, source = 'WHATSAPP_BOT') 
     if (c) catLine = `\n🏷️ <b>${c.icon || ''} ${c.name}</b>${tx._category_auto ? ' <i>(IA)</i>' : ''}`;
   }
   const typeIcon = { NOS: '👫', MIO: '🧑', PRESTAMO: '🤝' }[parsed.type];
+  const ownerLine = parsed.type === 'MIO'
+    ? (benef ? `Personal de: <b>${benef}</b>\n` : '')
+    : (benef ? `Para: <b>${benef}</b>\n` : '');
   await sendMessage(chatId,
     `${typeIcon} <b>Registrado #${parsed.type}</b>\n` +
     `${parsed.currency} <b>${parsed.amount.toFixed(2)}</b> · ~$${Number(tx.amount_usd).toFixed(2)} USD${usdtLine}${catLine}\n` +
-    (benef ? `Para: <b>${benef}</b>\n` : '') +
+    ownerLine +
+    (await walletLine(tx)) +
     (parsed.description ? `<i>${parsed.description}</i>` : ''));
   notifyPartner(tx).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Receipts with several products: the bill is turned into a draft and each line
+// gets assigned to whoever it belongs to (shared, or one member) before saving.
+// ---------------------------------------------------------------------------
+const ASSIGN_SHARED = 'NOS';
+
+function normalizeItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map(it => ({
+      name: String(it?.name || '').trim().slice(0, 60),
+      amount: Number(it?.amount_bs ?? it?.amount),
+    }))
+    .filter(it => it.name && isFinite(it.amount) && it.amount > 0)
+    .slice(0, 20); // Telegram keyboards get unusable beyond this
+}
+
+function draftKeyboard(draftId, payload, members) {
+  const label = (assign) => {
+    if (assign === ASSIGN_SHARED) return '👫 Nos';
+    const m = members.find(u => u.id === assign);
+    return m ? `🧑 ${m.short || m.name}` : '👫 Nos';
+  };
+  const n = (v) => Number(v).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const rows = payload.items.map((it, i) => ([{
+    text: `${it.name} · ${n(it.amount)} → ${label(it.assign)}`,
+    callback_data: `di:${draftId}:${i}`,
+  }]));
+  rows.push([
+    { text: '✅ Guardar', callback_data: `dok:${draftId}` },
+    { text: '❌ Cancelar', callback_data: `dno:${draftId}` },
+  ]);
+  return { inline_keyboard: rows };
+}
+
+function draftText(payload, members) {
+  const n = (v) => Number(v).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const total = payload.items.reduce((a, it) => a + Number(it.amount), 0);
+  const perPerson = {};
+  for (const it of payload.items) {
+    const key = it.assign === ASSIGN_SHARED ? '👫 Compartido' : (members.find(u => u.id === it.assign)?.name || '?');
+    perPerson[key] = (perPerson[key] || 0) + Number(it.amount);
+  }
+  const resume = Object.entries(perPerson).map(([k, v]) => `· ${k}: <b>${n(v)} Bs</b>`).join('\n');
+  return `🧾 <b>Factura detectada</b>${payload.bank ? ` · ${payload.bank}` : ''}\n` +
+    `Total: <b>${n(total)} Bs</b> · ${payload.items.length} producto(s)\n\n` +
+    `Toca cada producto para cambiar de quién es:\n${resume}\n\n` +
+    `<i>Cuando esté listo, pulsa Guardar.</i>`;
+}
+
+async function startReceiptDraft(me, chatId, items, meta) {
+  const members = (await query('SELECT id, name, short FROM app_users WHERE is_active ORDER BY created_at')).rows;
+  const payload = {
+    bank: meta.bank || null,
+    reference: meta.reference || null,
+    currency: 'BS',
+    items: items.map(it => ({ ...it, assign: me.id })), // default: whoever sent the photo
+  };
+  const d = await query(
+    'INSERT INTO tg_drafts(chat_id, user_id, payload) VALUES($1,$2,$3) RETURNING id',
+    [chatId, me.id, JSON.stringify(payload)]
+  );
+  const draftId = d.rows[0].id;
+  const sent = await sendMessage(chatId, draftText(payload, members), { reply_markup: draftKeyboard(draftId, payload, members) });
+  if (sent?.message_id) await query('UPDATE tg_drafts SET message_id=$1 WHERE id=$2', [sent.message_id, draftId]);
+}
+
+async function handleDraftCallback(cq, data) {
+  const [action, draftId, idxRaw] = data.split(':');
+  const chatId = cq.message?.chat?.id;
+  const d = (await query("SELECT * FROM tg_drafts WHERE id=$1 AND status='OPEN'", [draftId])).rows[0];
+  if (!d) { await answerCallback(cq.id, 'Esta factura ya no está disponible'); return; }
+  const members = (await query('SELECT id, name, short FROM app_users WHERE is_active ORDER BY created_at')).rows;
+  const payload = typeof d.payload === 'string' ? JSON.parse(d.payload) : d.payload;
+
+  if (action === 'dno') {
+    await query("UPDATE tg_drafts SET status='CANCELLED' WHERE id=$1", [draftId]);
+    await answerCallback(cq.id, 'Cancelado');
+    await editMessage(chatId, d.message_id, '❌ <b>Factura descartada</b>').catch(() => {});
+    return;
+  }
+
+  if (action === 'di') {
+    // Cycle: shared → member 1 → member 2 → ... → shared
+    const idx = parseInt(idxRaw, 10);
+    const item = payload.items[idx];
+    if (!item) { await answerCallback(cq.id, 'Producto no encontrado'); return; }
+    const cycle = [ASSIGN_SHARED, ...members.map(m => m.id)];
+    const pos = cycle.indexOf(item.assign);
+    item.assign = cycle[(pos + 1) % cycle.length];
+    await query('UPDATE tg_drafts SET payload=$1 WHERE id=$2', [JSON.stringify(payload), draftId]);
+    await answerCallback(cq.id, '');
+    await editMessage(chatId, d.message_id, draftText(payload, members), {
+      reply_markup: draftKeyboard(draftId, payload, members),
+    }).catch(() => {});
+    return;
+  }
+
+  if (action === 'dok') {
+    const me = (await query('SELECT id, name FROM app_users WHERE id=$1', [d.user_id])).rows[0];
+    if (!me) { await answerCallback(cq.id, 'Usuario no encontrado'); return; }
+    const created = [];
+    for (const it of payload.items) {
+      const shared = it.assign === ASSIGN_SHARED;
+      const tx = await createTransaction({
+        payer_id: me.id,
+        type: shared ? 'NOS' : 'MIO',
+        beneficiary_id: shared || it.assign === me.id ? null : it.assign,
+        original_amount: String(it.amount),
+        original_currency: payload.currency || 'BS',
+        description: [it.name, payload.bank].filter(Boolean).join(' · '),
+        created_via: 'OCR',
+      });
+      created.push(tx);
+    }
+    await query("UPDATE tg_drafts SET status='SAVED' WHERE id=$1", [draftId]);
+    await answerCallback(cq.id, `Guardado: ${created.length} gasto(s)`);
+    const totalUsd = created.reduce((a, t) => a + Number(t.amount_usd), 0);
+    const last = created[created.length - 1];
+    await editMessage(chatId, d.message_id,
+      `✅ <b>Factura registrada</b>\n${created.length} gasto(s) · ~$${totalUsd.toFixed(2)} USD\n` +
+      (await walletLine(last))
+    ).catch(() => {});
+    for (const tx of created) notifyPartner(tx).catch(() => {});
+    return;
+  }
+}
+
+// "💳 Venezuela: 372.534,64 Bs" — shown after a bot expense so the balance is visible.
+async function walletLine(tx) {
+  if (!tx?.wallet_id || tx.wallet_amount === null || tx.wallet_amount === undefined) return '';
+  const w = (await query('SELECT name, currency, current_balance FROM wallets WHERE id=$1', [tx.wallet_id])).rows[0];
+  if (!w) return '';
+  const sym = { USD: '$', BS: 'Bs', EUR: '€', USDT: '₮' }[w.currency] || w.currency;
+  const n = (v) => Number(v).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `💳 <b>${w.name}:</b> −${n(tx.wallet_amount)} → queda ${n(w.current_balance)} ${sym}\n`;
 }
 
 // Which wallet should this expense come out of?
@@ -719,6 +864,11 @@ async function dispatch(req, params) {
     if (upd.callback_query) {
       const cq = upd.callback_query;
       const data = cq.data || '';
+      if (data.startsWith('di:') || data.startsWith('dok:') || data.startsWith('dno:')) {
+        try { await handleDraftCallback(cq, data); }
+        catch (e) { console.error('draft callback', e.message); await answerCallback(cq.id, 'Error al procesar'); }
+        return json({ ok: true });
+      }
       if (data.startsWith('bind:')) {
         const userId = data.slice(5);
         const chatId = cq.message?.chat?.id;
@@ -774,6 +924,8 @@ async function dispatch(req, params) {
       return json({ ok: true });
     }
     const me = bound.rows[0];
+    // Known members let the parser resolve "#Mio A" / "#Prestamo J" reliably.
+    const activeUsers = (await query('SELECT id, name, short FROM app_users WHERE is_active ORDER BY created_at')).rows;
 
     // Handle voice / audio
     if (msg.voice || msg.audio) {
@@ -783,7 +935,7 @@ async function dispatch(req, params) {
         const { buffer } = await downloadFile(fileId);
         const transcript = await transcribeAudio(buffer, 'voice.ogg', mime);
         await sendMessage(chatId, `🎤 <i>Escuché:</i> "${transcript}"`);
-        const parsed = parseExpenseText(transcript);
+        const parsed = parseExpenseText(transcript, activeUsers);
         if (!parsed) {
           await sendMessage(chatId, '❌ No pude interpretar un gasto. Intenta: "gasté 30 dólares en cena compartido"');
           return json({ ok: true });
@@ -799,13 +951,22 @@ async function dispatch(req, params) {
       try {
         const { buffer } = await downloadFile(largest.file_id);
         const data = await extractReceipt(buffer, 'image/jpeg');
+
+        // A bill with several lines: ask who pays each product before saving.
+        const items = normalizeItems(data?.items);
+        if (items.length >= 2) {
+          await sendMessage(chatId, `🧾 <b>OCR:</b> ${items.length} productos leídos${data.bank ? ' · ' + data.bank : ''}`);
+          await startReceiptDraft(me, chatId, items, data);
+          return json({ ok: true });
+        }
+
         const amt = Number(data?.amount_bs);
         if (!amt || !isFinite(amt) || amt <= 0) {
           await sendMessage(chatId, `📷 No pude leer el monto claramente. Intenta con una foto más nítida o escribe el gasto.`);
           return json({ ok: true });
         }
         // Determine type from caption if any
-        const captionParsed = parseExpenseText(text);
+        const captionParsed = parseExpenseText(text, activeUsers);
         const type = captionParsed?.type || 'MIO';
         const description = data.description || text || `Pago ${data.bank || ''} ${data.reference ? '#'+data.reference : ''}`.trim();
         const parsed = { amount: amt, currency: 'BS', description, type, beneficiaryHint: captionParsed?.beneficiaryHint };
@@ -817,7 +978,7 @@ async function dispatch(req, params) {
 
     // Handle text
     if (text) {
-      const parsed = parseExpenseText(text);
+      const parsed = parseExpenseText(text, activeUsers);
       if (!parsed) {
         await sendMessage(chatId, '❌ No entendí. Prueba: <code>30$ cena #Nos J</code>\nEscribe /help para más ejemplos.');
         return json({ ok: true });

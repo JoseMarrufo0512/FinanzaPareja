@@ -2,6 +2,8 @@
 //   BASE=http://localhost:3000 node tests/api.test.mjs
 // The database is expected to be empty (see tests/reset-db.sh).
 
+import { execSync } from 'node:child_process';
+
 const BASE = process.env.BASE || 'http://localhost:3000';
 const PIN = '1234';
 
@@ -224,6 +226,78 @@ async function main() {
     }
     const bad = await api('/settlements', { method: 'POST', body: JSON.stringify({ payer_id: jose.id, receiver_id: jose.id, amount_usd: '5' }) });
     check('rechaza liquidación consigo mismo', bad.status === 422, `status=${bad.status}`);
+  }
+
+  // ── TELEGRAM: FACTURA POR PRODUCTOS ─────────────────────────────────
+  console.log('\nTELEGRAM · QUIÉN PAGA CADA PRODUCTO');
+  {
+    const CHAT = 999001;
+    const SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || 'test_webhook_secret_local';
+    const psql = (sql) => execSync(
+      `psql "${process.env.DEV_DATABASE_URL || 'postgres://dev@127.0.0.1:55432/nf_dev'}" -tAqc ${JSON.stringify(sql)}`,
+      { encoding: 'utf8' }
+    ).trim();
+
+    psql(`UPDATE app_users SET telegram_chat_id=${CHAT} WHERE id='${jose.id}'`);
+    const payload = JSON.stringify({
+      bank: 'Test Bar', currency: 'BS',
+      items: [
+        { name: 'Mojito Limon', amount: 120, assign: jose.id },
+        { name: 'Cerveza', amount: 80, assign: jose.id },
+      ],
+    });
+    const draftId = psql(`INSERT INTO tg_drafts(chat_id, user_id, payload) VALUES(${CHAT}, '${jose.id}', '${payload}') RETURNING id`);
+    check('crea el borrador de factura', /^[0-9a-f-]{36}$/.test(draftId), draftId);
+
+    const callback = (data) => fetch(BASE + '/api/webhooks/telegram', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-telegram-bot-api-secret-token': SECRET },
+      body: JSON.stringify({ callback_query: { id: '1', data, message: { chat: { id: CHAT }, message_id: 1 } } }),
+    }).then(r => r.status);
+
+    // Each tap cycles: compartido → miembro 1 → miembro 2 → ... → compartido.
+    // Tap until each product lands on the owner we want.
+    const readDraft = () => JSON.parse(psql(`SELECT payload FROM tg_drafts WHERE id='${draftId}'`));
+    const cycleUntil = async (idx, want) => {
+      for (let i = 0; i < 6; i++) {
+        if (readDraft().items[idx].assign === want) return true;
+        await callback(`di:${draftId}:${idx}`);
+      }
+      return readDraft().items[idx].assign === want;
+    };
+    const okShared = await cycleUntil(0, 'NOS');       // Mojito → compartido
+    const okAli = await cycleUntil(1, aliexis.id);     // Cerveza → de Aliexis
+    check('el botón rota hasta compartido', okShared);
+    check('el botón rota hasta un miembro concreto', okAli);
+
+    const state = readDraft();
+    check('el botón rota el dueño de cada producto',
+      state.items[0].assign === 'NOS' && state.items[1].assign === aliexis.id,
+      JSON.stringify(state.items.map(i => i.assign)));
+
+    const before = (await api('/transactions?limit=100')).body.length;
+    await callback(`dok:${draftId}`);
+    const txs = (await api('/transactions?limit=100')).body;
+    check('guardar crea un gasto por producto', txs.length === before + 2, `${before} → ${txs.length}`);
+
+    const mojito = txs.find(t => (t.description || '').startsWith('Mojito Limon'));
+    const cerveza = txs.find(t => (t.description || '').startsWith('Cerveza'));
+    check('el producto compartido queda como #Nos', mojito?.type === 'NOS' && near(mojito?.original_amount, 120), JSON.stringify(mojito?.type));
+    check('el producto de Aliexis queda como #Mio suyo',
+      cerveza?.type === 'MIO' && cerveza?.beneficiary_id === aliexis.id, `${cerveza?.type}/${cerveza?.beneficiary_name}`);
+    check('los gastos de la factura descuentan la billetera', !!mojito?.wallet_id && !!cerveza?.wallet_id);
+
+    const splitsM = (await api('/transactions/' + mojito.id + '/splits')).body;
+    check('el producto compartido se reparte entre los miembros', splitsM.length >= 2, `n=${splitsM.length}`);
+    const splitsC = (await api('/transactions/' + cerveza.id + '/splits')).body;
+    check('el producto personal recae solo en Aliexis', splitsC.length === 1 && splitsC[0].user_id === aliexis.id);
+
+    const status = psql(`SELECT status FROM tg_drafts WHERE id='${draftId}'`);
+    check('el borrador queda cerrado', status === 'SAVED', status);
+
+    const replay = await callback(`dok:${draftId}`);
+    const after = (await api('/transactions?limit=100')).body.length;
+    check('reenviar el mismo botón no duplica gastos', after === txs.length, `${txs.length} → ${after}`);
   }
 
   // ── VALIDACIONES (regresión de seguridad) ───────────────────────────
