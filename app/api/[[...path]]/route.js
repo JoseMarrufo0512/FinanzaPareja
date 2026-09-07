@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
 import Decimal from 'decimal.js';
-import { initDb, query } from '@/lib/db';
+import { initDb, query, withTx } from '@/lib/db';
 import { refreshRates, getLatestRates } from '@/lib/rates';
-import { D, fmt } from '@/lib/money';
+import { D, fmt, convertUsdTo } from '@/lib/money';
+import { computeSplits, settleUp } from '@/lib/splits';
 import { parseExpenseText } from '@/lib/parser';
 import { tg, sendMessage, answerCallback, downloadFile, setWebhook, getWebhookInfo } from '@/lib/telegram';
 import { transcribeAudio, extractReceipt, suggestCategory } from '@/lib/ai';
@@ -58,6 +59,29 @@ async function handleParsedExpense(me, parsed, chatId, source = 'WHATSAPP_BOT') 
   notifyPartner(tx).catch(() => {});
 }
 
+// Which wallet should this expense come out of?
+// Explicit choice wins; otherwise the payer's default wallet, and failing that
+// their only wallet in the expense currency. Returns null when undecidable.
+async function resolveWalletId(client, { wallet_id, payer_id, currency }) {
+  if (wallet_id) return wallet_id;
+  if (!payer_id) return null;
+  const u = (await client.query('SELECT default_wallet_id FROM app_users WHERE id=$1', [payer_id])).rows[0];
+  if (u?.default_wallet_id) return u.default_wallet_id;
+  const same = await client.query(
+    'SELECT id FROM wallets WHERE user_id=$1 AND currency=$2',
+    [payer_id, currency]
+  );
+  if (same.rowCount === 1) return same.rows[0].id;
+  return null;
+}
+
+// How much leaves the wallet, expressed in the WALLET's own currency.
+function walletDeduction({ wallet, originalAmount, originalCurrency, amountUsd, rates }) {
+  if (!wallet) return null;
+  if (wallet.currency === originalCurrency) return D(originalAmount).toDecimalPlaces(2);
+  return convertUsdTo(amountUsd, wallet.currency, rates);
+}
+
 // Shared helper: create transaction (used by web and telegram)
 async function createTransaction(b) {
   const rates = await getLatestRates();
@@ -99,16 +123,64 @@ async function createTransaction(b) {
       }
     } catch (e) { console.error('auto-categorize', e.message); }
   }
-  const r = await query(
-    `INSERT INTO transactions(payer_id, wallet_id, type, original_amount, original_currency, applied_rate, amount_usd, amount_usdt, usdt_rate, beneficiary_id, category_id, description, receipt_image_url, created_via, transaction_date)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, COALESCE($15::timestamptz, NOW())) RETURNING *`,
-    [b.payer_id, b.wallet_id || null, b.type, originalAmount.toFixed(2), currency, appliedRate.toFixed(6), amountUsd.toFixed(2),
-     amountUsdt ? amountUsdt.toString() : null, usdtRate, b.beneficiary_id || null, categoryId, b.description || null,
-     b.receipt_image_url || null, b.created_via || 'WEB', b.transaction_date || null]
-  );
-  const created = r.rows[0];
+  // Insert + wallet discount + participant shares must land together or not at all.
+  const created = await withTx(async (client) => {
+    const walletId = await resolveWalletId(client, { wallet_id: b.wallet_id, payer_id: b.payer_id, currency });
+    let wallet = null;
+    if (walletId) {
+      const w = await client.query('SELECT id, currency, current_balance FROM wallets WHERE id=$1 FOR UPDATE', [walletId]);
+      wallet = w.rows[0] || null;
+    }
+    const deduction = walletDeduction({
+      wallet, originalAmount, originalCurrency: currency, amountUsd, rates,
+    });
+
+    const r = await client.query(
+      `INSERT INTO transactions(payer_id, wallet_id, type, original_amount, original_currency, applied_rate, amount_usd, amount_usdt, usdt_rate, beneficiary_id, category_id, description, receipt_image_url, created_via, transaction_date, wallet_amount)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, COALESCE($15::timestamptz, NOW()), $16) RETURNING *`,
+      [b.payer_id, wallet ? wallet.id : null, b.type, originalAmount.toFixed(2), currency, appliedRate.toFixed(6), amountUsd.toFixed(2),
+       amountUsdt ? amountUsdt.toString() : null, usdtRate, b.beneficiary_id || null, categoryId, b.description || null,
+       b.receipt_image_url || null, b.created_via || 'WEB', b.transaction_date || null,
+       deduction ? deduction.toFixed(2) : null]
+    );
+    const tx = r.rows[0];
+
+    if (wallet && deduction) {
+      const upd = await client.query(
+        'UPDATE wallets SET current_balance = current_balance - $1 WHERE id=$2 RETURNING current_balance',
+        [deduction.toFixed(2), wallet.id]
+      );
+      tx._wallet_balance = upd.rows[0]?.current_balance ?? null;
+    }
+
+    await writeSplits(client, tx, b.participant_ids);
+    return tx;
+  });
+
   created._category_auto = categoryAuto;
   return created;
+}
+
+// Persist who owes what for a transaction (see lib/splits.js for the rules).
+async function writeSplits(client, tx, participantIds) {
+  const activeUserIds = (await client.query('SELECT id FROM app_users WHERE is_active ORDER BY created_at')).rows.map(r => r.id);
+  const splits = computeSplits({
+    type: tx.type,
+    payer_id: tx.payer_id,
+    beneficiary_id: tx.beneficiary_id,
+    amount_usd: tx.amount_usd,
+    amount_usdt: tx.amount_usdt,
+    activeUserIds,
+    participantIds,
+  });
+  await client.query('DELETE FROM transaction_splits WHERE transaction_id=$1', [tx.id]);
+  for (const s of splits) {
+    await client.query(
+      'INSERT INTO transaction_splits(transaction_id, user_id, share_usd, share_usdt) VALUES($1,$2,$3,$4)',
+      [tx.id, s.user_id, s.share_usd, s.share_usdt]
+    );
+  }
+  return splits;
 }
 
 async function notifyPartner(tx) {
@@ -267,10 +339,53 @@ async function dispatch(req, params) {
     );
     return json(r.rows[0], 201);
   }
+  if (path.startsWith('/users/') && method === 'PATCH') {
+    const id = path.split('/')[2];
+    const b = await req.json().catch(() => ({}));
+    const sets = [], vals = [];
+    if (b.name !== undefined) {
+      if (!b.name.toString().trim()) return err('Nombre requerido', 422);
+      vals.push(b.name.toString().trim().slice(0, 50)); sets.push(`name=$${vals.length}`);
+    }
+    if (b.short !== undefined) { vals.push(b.short.toString().toUpperCase().slice(0, 3)); sets.push(`short=$${vals.length}`); }
+    if (b.color !== undefined) { vals.push(b.color); sets.push(`color=$${vals.length}`); }
+    if (b.email !== undefined) { vals.push(b.email ? b.email.toString().trim().toLowerCase() : null); sets.push(`email=$${vals.length}`); }
+    if (b.default_wallet_id !== undefined) { vals.push(b.default_wallet_id || null); sets.push(`default_wallet_id=$${vals.length}`); }
+    if (b.is_active !== undefined) {
+      if (!b.is_active) {
+        const actives = (await query('SELECT COUNT(*)::int AS n FROM app_users WHERE is_active AND id <> $1', [id])).rows[0].n;
+        if (actives < 1) return err('Debe quedar al menos un miembro activo', 422);
+      }
+      vals.push(!!b.is_active); sets.push(`is_active=$${vals.length}`);
+    }
+    if (!sets.length) return err('Nada que actualizar', 422);
+    vals.push(id);
+    const r = await query(`UPDATE app_users SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals);
+    if (!r.rowCount) return err('Miembro no encontrado', 404);
+    return json(r.rows[0]);
+  }
+
+  // Removing a member: hard delete only while they have no financial history,
+  // otherwise deactivate so past expenses and balances stay intact.
   if (path.startsWith('/users/') && method === 'DELETE') {
     const id = path.split('/')[2];
+    const actives = (await query('SELECT COUNT(*)::int AS n FROM app_users WHERE is_active AND id <> $1', [id])).rows[0].n;
+    if (actives < 1) return err('Debe quedar al menos un miembro activo', 422);
+    const usage = (await query(`
+      SELECT
+        (SELECT COUNT(*) FROM transactions WHERE payer_id=$1 OR beneficiary_id=$1)::int AS tx,
+        (SELECT COUNT(*) FROM transaction_splits WHERE user_id=$1)::int AS splits,
+        (SELECT COUNT(*) FROM settlements WHERE payer_id=$1 OR receiver_id=$1)::int AS setts,
+        (SELECT COUNT(*) FROM wallets WHERE user_id=$1)::int AS wallets
+    `, [id])).rows[0];
+    const hasHistory = usage.tx + usage.splits + usage.setts + usage.wallets > 0;
+    if (hasHistory) {
+      const r = await query('UPDATE app_users SET is_active=FALSE WHERE id=$1 RETURNING *', [id]);
+      if (!r.rowCount) return err('Miembro no encontrado', 404);
+      return json({ ok: true, deactivated: true, user: r.rows[0], reason: 'Tiene historial financiero; se desactivó en lugar de borrarse.' });
+    }
     await query('DELETE FROM app_users WHERE id=$1', [id]);
-    return json({ ok: true });
+    return json({ ok: true, deleted: true });
   }
 
   // -------- CATEGORIES --------
@@ -297,15 +412,128 @@ async function dispatch(req, params) {
   }
   if (path === '/wallets' && method === 'POST') {
     const b = await req.json();
+    if (!b.user_id) return err('Dueño requerido', 422);
+    if (!b.name || !b.name.toString().trim()) return err('Nombre requerido', 422);
+    const bal = Number(b.current_balance || 0);
+    if (!isFinite(bal) || Math.abs(bal) > 1e12) return err('Saldo inválido', 422);
+    if (!['USD', 'BS', 'EUR', 'USDT'].includes(b.currency || 'USD')) return err('Moneda inválida', 422);
     const r = await query(
-      'INSERT INTO wallets(user_id,name,account_type,currency,current_balance) VALUES($1,$2,$3,$4,$5) RETURNING *',
-      [b.user_id, b.name, b.account_type || 'BANK', b.currency || 'USD', b.current_balance || 0]
+      'INSERT INTO wallets(user_id,name,account_type,currency,current_balance,initial_balance) VALUES($1,$2,$3,$4,$5,$5) RETURNING *',
+      [b.user_id, b.name.toString().trim().slice(0, 80), b.account_type || 'BANK', b.currency || 'USD', bal.toFixed(2)]
     );
     return json(r.rows[0], 201);
   }
+
+  // Adjust a wallet balance by hand (deposit / correction). Keeps initial_balance
+  // in sync so the recalculation below stays consistent.
+  if (path.match(/^\/wallets\/[^/]+\/adjust$/) && method === 'POST') {
+    const id = path.split('/')[2];
+    const b = await req.json().catch(() => ({}));
+    const delta = Number(b.delta);
+    if (!isFinite(delta) || delta === 0 || Math.abs(delta) > 1e12) return err('Ajuste inválido', 422);
+    const r = await query(
+      `UPDATE wallets SET current_balance = current_balance + $1, initial_balance = COALESCE(initial_balance,0) + $1
+       WHERE id=$2 RETURNING *`, [delta.toFixed(2), id]
+    );
+    if (!r.rowCount) return err('Billetera no encontrada', 404);
+    return json(r.rows[0]);
+  }
+
+  // Rebuild every wallet balance from initial_balance minus the expenses charged
+  // to it. Also links past expenses that never got a wallet (Telegram/OCR ones)
+  // when the payer has exactly one wallet in that currency.
+  if (path === '/wallets/recalculate' && method === 'POST') {
+    const b = await req.json().catch(() => ({}));
+    const autoLink = b.link !== false;
+    const dryRun = b.dry_run === true;
+    const rates = await getLatestRates();
+    const result = await withTx(async (client) => {
+      const before = (await client.query('SELECT id, name, currency, current_balance, initial_balance FROM wallets ORDER BY name')).rows;
+      const walletById = new Map(before.map(w => [w.id, w]));
+
+      // 1. Adopt orphan expenses whose payer has exactly one wallet in that currency.
+      const linked = [];
+      if (autoLink) {
+        const orphans = (await client.query(
+          `SELECT id, payer_id, original_currency, original_amount, amount_usd, description
+           FROM transactions WHERE wallet_id IS NULL`
+        )).rows;
+        for (const t of orphans) {
+          const w = await client.query(
+            'SELECT id FROM wallets WHERE user_id=$1 AND currency=$2',
+            [t.payer_id, t.original_currency]
+          );
+          if (w.rowCount !== 1) continue;
+          linked.push({ transaction_id: t.id, wallet_id: w.rows[0].id, description: t.description, amount: t.original_amount, currency: t.original_currency });
+          if (!dryRun) await client.query('UPDATE transactions SET wallet_id=$1 WHERE id=$2', [w.rows[0].id, t.id]);
+        }
+      }
+      const linkedById = new Map(linked.map(l => [l.transaction_id, l.wallet_id]));
+
+      // 2. Price every charged expense in its wallet's currency.
+      const all = (await client.query(`
+        SELECT id, wallet_id, original_amount, original_currency, amount_usd FROM transactions
+      `)).rows;
+      const spentByWallet = new Map();
+      let priced = 0, unpriced = 0;
+      for (const t of all) {
+        const walletId = t.wallet_id || linkedById.get(t.id) || null;
+        if (!walletId) continue;
+        const wallet = walletById.get(walletId);
+        if (!wallet) continue;
+        const amt = walletDeduction({
+          wallet, originalAmount: t.original_amount, originalCurrency: t.original_currency,
+          amountUsd: t.amount_usd, rates,
+        });
+        if (!amt) { unpriced++; continue; }
+        priced++;
+        spentByWallet.set(walletId, D(spentByWallet.get(walletId) || 0).plus(amt));
+        if (!dryRun) await client.query('UPDATE transactions SET wallet_amount=$1 WHERE id=$2', [amt.toFixed(2), t.id]);
+      }
+
+      // 3. Rebuild balances: initial - everything spent from it.
+      const wallets = before.map(w => {
+        const spent = D(spentByWallet.get(w.id) || 0);
+        const projected = D(w.initial_balance ?? w.current_balance).minus(spent);
+        return {
+          id: w.id, name: w.name, currency: w.currency,
+          initial_balance: w.initial_balance,
+          previous_balance: w.current_balance,
+          spent: spent.toFixed(2),
+          current_balance: projected.toFixed(2),
+        };
+      });
+      if (!dryRun) {
+        for (const w of wallets) {
+          await client.query('UPDATE wallets SET current_balance=$1 WHERE id=$2', [w.current_balance, w.id]);
+        }
+      }
+      return { dry_run: dryRun, linked_transactions: linked.length, linked, priced_transactions: priced, unpriced_transactions: unpriced, wallets };
+    });
+    return json({ ok: true, ...result });
+  }
+
+  if (path.startsWith('/wallets/') && method === 'PATCH') {
+    const id = path.split('/')[2];
+    const b = await req.json().catch(() => ({}));
+    const sets = [], vals = [];
+    if (b.name !== undefined) { vals.push(b.name.toString().trim().slice(0, 80)); sets.push(`name=$${vals.length}`); }
+    if (b.account_type !== undefined) { vals.push(b.account_type); sets.push(`account_type=$${vals.length}`); }
+    if (!sets.length) return err('Nada que actualizar', 422);
+    vals.push(id);
+    const r = await query(`UPDATE wallets SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals);
+    if (!r.rowCount) return err('Billetera no encontrada', 404);
+    return json(r.rows[0]);
+  }
+
   if (path.startsWith('/wallets/') && method === 'DELETE') {
     const id = path.split('/')[2];
-    await query('DELETE FROM wallets WHERE id=$1', [id]);
+    // Keep the expense history: unlink it instead of cascading the delete.
+    await withTx(async (client) => {
+      await client.query('UPDATE transactions SET wallet_id=NULL, wallet_amount=NULL WHERE wallet_id=$1', [id]);
+      await client.query('UPDATE app_users SET default_wallet_id=NULL WHERE default_wallet_id=$1', [id]);
+      await client.query('DELETE FROM wallets WHERE id=$1', [id]);
+    });
     return json({ ok: true });
   }
 
@@ -375,9 +603,26 @@ async function dispatch(req, params) {
     return json(tx, 201);
   }
 
+  // Who this expense was divided among.
+  if (path.match(/^\/transactions\/[^/]+\/splits$/) && method === 'GET') {
+    const id = path.split('/')[2];
+    const r = await query(`
+      SELECT s.*, u.name AS user_name, u.short AS user_short, u.color AS user_color
+      FROM transaction_splits s JOIN app_users u ON u.id = s.user_id
+      WHERE s.transaction_id = $1 ORDER BY u.created_at`, [id]);
+    return json(r.rows);
+  }
+
   if (path.startsWith('/transactions/') && method === 'DELETE') {
     const id = path.split('/')[2];
-    await query('DELETE FROM transactions WHERE id=$1', [id]);
+    // Deleting an expense gives the money back to the wallet it came from.
+    await withTx(async (client) => {
+      const t = (await client.query('SELECT wallet_id, wallet_amount FROM transactions WHERE id=$1', [id])).rows[0];
+      if (t?.wallet_id && t.wallet_amount) {
+        await client.query('UPDATE wallets SET current_balance = current_balance + $1 WHERE id=$2', [t.wallet_amount, t.wallet_id]);
+      }
+      await client.query('DELETE FROM transactions WHERE id=$1', [id]); // splits cascade
+    });
     return json({ ok: true });
   }
 
@@ -419,23 +664,17 @@ async function dispatch(req, params) {
     const amtUsd = D(b.amount_usd);
     let amtUsdt = null;
     if (binUsdt.gt(0) && bcvUsd.gt(0)) amtUsdt = amtUsd.mul(bcvUsd).div(binUsdt).toDecimalPlaces(2).toString();
+    if (b.payer_id === b.receiver_id) return err('El pagador y el receptor no pueden ser la misma persona', 422);
+    const parties = (await query('SELECT id FROM app_users WHERE id IN ($1,$2)', [b.payer_id, b.receiver_id])).rowCount;
+    if (parties !== 2) return err('Participantes inválidos', 422);
+
+    // Under the ledger model a settlement is just a payment between two members:
+    // it offsets their balances directly, so transactions stay untouched (with 3+
+    // members, flipping is_reconciled would wrongly clear everyone else's share).
     const r = await query(
-      `INSERT INTO settlements(payer_id, receiver_id, amount_usd, amount_usdt, notes)
-       VALUES($1,$2,$3,$4,$5) RETURNING *`,
+      `INSERT INTO settlements(payer_id, receiver_id, amount_usd, amount_usdt, notes, pre_ledger)
+       VALUES($1,$2,$3,$4,$5,FALSE) RETURNING *`,
       [b.payer_id, b.receiver_id, amtUsd.toFixed(2), amtUsdt, b.notes || null]
-    );
-    // Mark all unreconciled NOS and PRESTAMO transactions involving these two users as reconciled
-    await query(
-      `UPDATE transactions SET is_reconciled=TRUE
-       WHERE is_reconciled=FALSE
-         AND type IN ('NOS','PRESTAMO')
-         AND (
-           (payer_id IN ($1,$2) AND type='NOS') OR
-           (type='PRESTAMO' AND (
-             (payer_id=$1 AND beneficiary_id=$2) OR (payer_id=$2 AND beneficiary_id=$1)
-           ))
-         )`,
-      [b.payer_id, b.receiver_id]
     );
     // Notify partner
     notifyPartner({
@@ -590,53 +829,106 @@ async function dispatch(req, params) {
 
   if (path === '/dashboard' && method === 'GET') {
     const month = url.searchParams.get('month') || new Date().toISOString().slice(0, 7);
-    const users = (await query('SELECT id, name, short, color FROM app_users ORDER BY created_at')).rows;
+    const users = (await query('SELECT id, name, short, color, is_active, telegram_chat_id, email, default_wallet_id FROM app_users ORDER BY created_at')).rows;
+    const rates = await getLatestRates();
 
-    // Net debt uses ALL-TIME unreconciled transactions (settlements reset it)
-    const txAgg = await query(`
-      SELECT type, payer_id, beneficiary_id,
-             SUM(amount_usd)::numeric AS total_usd,
-             SUM(COALESCE(amount_usdt,0))::numeric AS total_usdt
-      FROM transactions
-      WHERE is_reconciled = FALSE
-      GROUP BY type, payer_id, beneficiary_id
-    `);
-
-    // Compute balances between users (for couple mode: net debt)
-    // For each user, sum of #NOS paid (they cover 50% for the other) + sum of PRESTAMO where beneficiary=other
-    // Balance owed FROM other TO this user = (0.5 * sum_nos_paid_by_this) + (sum_prestamo_this_paid_for_other in USDT)
-    const balances = {};
+    // ---- Ledger --------------------------------------------------------
+    // Every member's net position = what they PAID minus what they OWE.
+    // Owed comes from transaction_splits, so #Nos divides across N members and
+    // #Mio lands on whoever the expense belongs to. Positive net = others owe them.
+    const paid = {}, owed = {}, frozenGiven = {}, frozenOwed = {};
+    const mioByUser = {}, nosShareByUser = {}, paidByUser = {};
     for (const u of users) {
-      balances[u.id] = { user: u, nos_paid_usd: '0', mio_usd: '0', prestamo_given_usd: '0', prestamo_given_usdt: '0', prestamo_received_usd: '0', prestamo_received_usdt: '0' };
+      paid[u.id] = D(0); owed[u.id] = D(0); frozenGiven[u.id] = D(0); frozenOwed[u.id] = D(0);
+      mioByUser[u.id] = D(0); nosShareByUser[u.id] = D(0); paidByUser[u.id] = D(0);
     }
-    for (const row of txAgg.rows) {
-      if (!balances[row.payer_id]) continue;
-      const b = balances[row.payer_id];
-      if (row.type === 'NOS') b.nos_paid_usd = D(b.nos_paid_usd).plus(row.total_usd).toString();
-      if (row.type === 'MIO') b.mio_usd = D(b.mio_usd).plus(row.total_usd).toString();
-      if (row.type === 'PRESTAMO') {
-        b.prestamo_given_usd = D(b.prestamo_given_usd).plus(row.total_usd).toString();
-        b.prestamo_given_usdt = D(b.prestamo_given_usdt).plus(row.total_usdt).toString();
-        if (row.beneficiary_id && balances[row.beneficiary_id]) {
-          balances[row.beneficiary_id].prestamo_received_usd = D(balances[row.beneficiary_id].prestamo_received_usd).plus(row.total_usd).toString();
-          balances[row.beneficiary_id].prestamo_received_usdt = D(balances[row.beneficiary_id].prestamo_received_usdt).plus(row.total_usdt).toString();
-        }
+
+    const openTx = (await query(`
+      SELECT id, type, payer_id, amount_usd, amount_usdt
+      FROM transactions WHERE is_reconciled = FALSE
+    `)).rows;
+    for (const t of openTx) {
+      if (paid[t.payer_id]) {
+        paid[t.payer_id] = paid[t.payer_id].plus(t.amount_usd);
+        if (t.type === 'PRESTAMO' && t.amount_usdt) frozenGiven[t.payer_id] = frozenGiven[t.payer_id].plus(t.amount_usdt);
       }
     }
+    const openSplits = (await query(`
+      SELECT s.user_id, s.share_usd, s.share_usdt, t.type
+      FROM transaction_splits s JOIN transactions t ON t.id = s.transaction_id
+      WHERE t.is_reconciled = FALSE
+    `)).rows;
+    for (const s of openSplits) {
+      if (!owed[s.user_id]) continue;
+      owed[s.user_id] = owed[s.user_id].plus(s.share_usd);
+      if (s.type === 'PRESTAMO' && s.share_usdt) frozenOwed[s.user_id] = frozenOwed[s.user_id].plus(s.share_usdt);
+    }
+    // Settlements recorded under the ledger model move money directly.
+    const openSettlements = (await query('SELECT payer_id, receiver_id, amount_usd FROM settlements WHERE pre_ledger = FALSE')).rows;
+    for (const s of openSettlements) {
+      if (paid[s.payer_id]) paid[s.payer_id] = paid[s.payer_id].plus(s.amount_usd);
+      if (owed[s.receiver_id]) owed[s.receiver_id] = owed[s.receiver_id].plus(s.amount_usd);
+    }
 
-    // Net debt (couple mode with 2 users)
+    const netByUser = {};
+    for (const u of users) netByUser[u.id] = paid[u.id].minus(owed[u.id]).toDecimalPlaces(2);
+
+    // Who pays whom, minimised to at most N-1 transfers.
+    const transfers = settleUp(netByUser).map(t => {
+      const usdt = convertUsdTo(t.amount_usd, 'USDT', rates);
+      return {
+        from: users.find(u => u.id === t.from),
+        to: users.find(u => u.id === t.to),
+        amount_usd: t.amount_usd,
+        amount_usdt: usdt ? usdt.toFixed(2) : null,
+      };
+    });
+
+    // Legacy shape kept so the couple view keeps working unchanged.
     let net = null;
-    if (users.length === 2) {
+    if (users.filter(u => u.is_active).length <= 2 && users.length >= 2) {
+      const t = transfers[0];
       const [A, B] = users;
-      const bA = balances[A.id], bB = balances[B.id];
-      // What A owes B = (half of NOS B paid) + (prestamo B gave A) - (half of NOS A paid) - (prestamo A gave B)
-      const aOwesB_usd = D(bB.nos_paid_usd).div(2).plus(bB.prestamo_given_usd).minus(D(bA.nos_paid_usd).div(2)).minus(bA.prestamo_given_usd);
-      const aOwesB_usdt = D(bB.nos_paid_usd).div(2).plus(bB.prestamo_given_usdt).minus(D(bA.nos_paid_usd).div(2)).minus(bA.prestamo_given_usdt);
-      net = {
-        from: aOwesB_usd.gte(0) ? A : B,
-        to: aOwesB_usd.gte(0) ? B : A,
-        amount_usd: aOwesB_usd.abs().toDecimalPlaces(2).toString(),
-        amount_usdt: aOwesB_usdt.abs().toDecimalPlaces(2).toString(),
+      net = t
+        ? { from: t.from, to: t.to, amount_usd: t.amount_usd, amount_usdt: t.amount_usdt || '0' }
+        : { from: A, to: B, amount_usd: '0.00', amount_usdt: '0.00' };
+    }
+
+    // ---- Per-member breakdown for the selected month --------------------
+    const monthSplits = (await query(`
+      SELECT s.user_id, s.share_usd, t.type
+      FROM transaction_splits s JOIN transactions t ON t.id = s.transaction_id
+      WHERE t.transaction_date >= $1::date AND t.transaction_date < ($1::date + interval '1 month')
+    `, [month + '-01'])).rows;
+    for (const s of monthSplits) {
+      if (!mioByUser[s.user_id]) continue;
+      if (s.type === 'MIO') mioByUser[s.user_id] = mioByUser[s.user_id].plus(s.share_usd);
+      if (s.type === 'NOS') nosShareByUser[s.user_id] = nosShareByUser[s.user_id].plus(s.share_usd);
+    }
+    const monthPaid = (await query(`
+      SELECT payer_id, SUM(amount_usd)::numeric AS total FROM transactions
+      WHERE transaction_date >= $1::date AND transaction_date < ($1::date + interval '1 month')
+      GROUP BY payer_id
+    `, [month + '-01'])).rows;
+    for (const r of monthPaid) if (paidByUser[r.payer_id]) paidByUser[r.payer_id] = D(r.total);
+
+    const perUser = users.map(u => ({
+      user: u,
+      mio_usd: mioByUser[u.id].toFixed(2),          // #Mio J / #Mio A — personal spend of this member
+      nos_share_usd: nosShareByUser[u.id].toFixed(2), // their slice of the shared expenses
+      total_usd: mioByUser[u.id].plus(nosShareByUser[u.id]).toFixed(2),
+      paid_usd: paidByUser[u.id].toFixed(2),        // what actually left their pocket this month
+      net_usd: netByUser[u.id].toFixed(2),          // + they are owed / - they owe (all time, open)
+      frozen_usdt: frozenGiven[u.id].minus(frozenOwed[u.id]).toDecimalPlaces(2).toFixed(2),
+    }));
+
+    // Legacy `balances` map (kept for compatibility with older clients).
+    const balances = {};
+    for (const u of users) {
+      const pu = perUser.find(p => p.user.id === u.id);
+      balances[u.id] = {
+        user: u, mio_usd: pu.mio_usd, nos_share_usd: pu.nos_share_usd,
+        paid_usd: paid[u.id].toFixed(2), owed_usd: owed[u.id].toFixed(2), net_usd: pu.net_usd,
       };
     }
 
@@ -669,12 +961,13 @@ async function dispatch(req, params) {
       WHERE transaction_date >= $1::date AND transaction_date < ($1::date + interval '1 month')
     `, [month + '-01'])).rows[0];
 
-    const rates = await getLatestRates();
-
     return json({
       month,
       users,
+      members: users.filter(u => u.is_active),
       balances,
+      per_user: perUser,
+      transfers,
       net,
       budgets: budgetsWithSpend,
       totals: totalsRow,
